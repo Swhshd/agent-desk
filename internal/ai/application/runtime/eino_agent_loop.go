@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,137 @@ import (
 	einojsonschema "github.com/eino-contrib/jsonschema"
 )
 
+const (
+	einoProviderAliasPrefix       = "cap_"
+	einoProviderReadableNameLimit = 35
+	einoProviderHashHexLength     = 24
+)
+
+var einoReservedToolNames = map[string]struct{}{
+	"tool_search":           {},
+	"conversation_decision": {},
+}
+
+type einoToolAliasMap struct {
+	aliasToInternal    map[string]string
+	internalToProvider map[string]string
+}
+
+func newEinoToolAliasMap(definitions []ai.ToolDefinition) (*einoToolAliasMap, error) {
+	return newEinoToolAliasMapWith(definitions, providerCapabilityAlias)
+}
+
+func newEinoToolAliasMapWith(definitions []ai.ToolDefinition, aliasFor func(string) string) (*einoToolAliasMap, error) {
+	if aliasFor == nil {
+		return nil, fmt.Errorf("provider tool alias generator is required")
+	}
+	aliases := &einoToolAliasMap{
+		aliasToInternal:    make(map[string]string, len(definitions)),
+		internalToProvider: make(map[string]string, len(definitions)),
+	}
+	for _, definition := range definitions {
+		internalName := definition.Name
+		if strings.TrimSpace(internalName) == "" {
+			return nil, fmt.Errorf("Eino tool name is required")
+		}
+		if _, exists := aliases.internalToProvider[internalName]; exists {
+			return nil, fmt.Errorf("duplicate internal Eino tool identity")
+		}
+
+		providerName := internalName
+		if _, reserved := einoReservedToolNames[internalName]; !reserved {
+			providerName = aliasFor(internalName)
+		}
+		if !isProviderSafeToolName(providerName) {
+			return nil, fmt.Errorf("provider tool name violates compatibility contract")
+		}
+		if _, exists := aliases.aliasToInternal[providerName]; exists {
+			return nil, fmt.Errorf("provider tool alias collision")
+		}
+		aliases.aliasToInternal[providerName] = internalName
+		aliases.internalToProvider[internalName] = providerName
+	}
+	return aliases, nil
+}
+
+func (m *einoToolAliasMap) internalName(providerName string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	name, ok := m.aliasToInternal[providerName]
+	return name, ok
+}
+
+func (m *einoToolAliasMap) providerName(internalName string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	name, ok := m.internalToProvider[internalName]
+	return name, ok
+}
+
+func providerCapabilityAlias(internalName string) string {
+	readable := strings.Map(func(char rune) rune {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' {
+			return char
+		}
+		return '_'
+	}, internalName)
+	readable = strings.Trim(readable, "_-")
+	if readable == "" {
+		readable = "tool"
+	}
+	if len(readable) > einoProviderReadableNameLimit {
+		readable = readable[:einoProviderReadableNameLimit]
+	}
+	digest := sha256.Sum256([]byte(internalName))
+	hash := hex.EncodeToString(digest[:])[:einoProviderHashHexLength]
+	return einoProviderAliasPrefix + readable + "_" + hash
+}
+
+func isProviderSafeToolName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, char := range name {
+		if !(char >= 'a' && char <= 'z') && !(char >= 'A' && char <= 'Z') &&
+			!(char >= '0' && char <= '9') && char != '_' && char != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func buildEinoToolSet(definitions []ai.ToolDefinition, execute ai.ToolCallExecutor) ([]einotool.BaseTool, *einoToolAliasMap, error) {
+	return buildEinoToolSetWith(definitions, execute, providerCapabilityAlias)
+}
+
+func buildEinoToolSetWith(definitions []ai.ToolDefinition, execute ai.ToolCallExecutor, aliasFor func(string) string) ([]einotool.BaseTool, *einoToolAliasMap, error) {
+	if execute == nil {
+		return nil, nil, fmt.Errorf("Eino tool executor is required")
+	}
+	aliases, err := newEinoToolAliasMapWith(definitions, aliasFor)
+	if err != nil {
+		return nil, nil, err
+	}
+	tools := make([]einotool.BaseTool, 0, len(definitions))
+	for _, definition := range definitions {
+		internalName := definition.Name
+		providerName, ok := aliases.providerName(internalName)
+		if !ok {
+			return nil, nil, fmt.Errorf("provider alias is missing for Eino tool")
+		}
+		providerDefinition := definition
+		providerDefinition.Name = providerName
+		registered, err := newEinoFunctionToolWithAliases(providerDefinition, aliases, execute)
+		if err != nil {
+			return nil, nil, err
+		}
+		tools = append(tools, registered)
+	}
+	return tools, aliases, nil
+}
+
 // einoAgentLoop is the production model/tool loop. AgentDesk still owns tool
 // authorization, business execution, interrupts, idempotency, and auditing.
 func einoAgentLoop(
@@ -31,20 +164,16 @@ func einoAgentLoop(
 	maxSteps int,
 	execute ai.ToolCallExecutor,
 ) (*ai.ToolLoopResult, error) {
+	tools, _, err := buildEinoToolSet(definitions, execute)
+	if err != nil {
+		return nil, fmt.Errorf("build provider-safe Eino tools: %w", err)
+	}
 	model, err := newEinoChatModel(ctx, config)
 	if err != nil {
 		return nil, err
 	}
 	if maxSteps <= 0 {
 		maxSteps = 6
-	}
-	tools := make([]einotool.BaseTool, 0, len(definitions))
-	for _, definition := range definitions {
-		tool, buildErr := newEinoFunctionTool(definition, execute)
-		if buildErr != nil {
-			return nil, buildErr
-		}
-		tools = append(tools, tool)
 	}
 	agent, err := react.NewAgent(ctx, &react.AgentConfig{
 		ToolCallingModel: model,
@@ -110,18 +239,24 @@ func isDashScopeQwenThinkingModel(config models.AIConfig) bool {
 }
 
 type einoFunctionTool struct {
-	info    *schema.ToolInfo
-	execute ai.ToolCallExecutor
+	info         *schema.ToolInfo
+	providerName string
+	aliases      *einoToolAliasMap
+	execute      ai.ToolCallExecutor
 }
 
 var _ einotool.InvokableTool = (*einoFunctionTool)(nil)
 
-func newEinoFunctionTool(definition ai.ToolDefinition, execute ai.ToolCallExecutor) (*einoFunctionTool, error) {
-	if strings.TrimSpace(definition.Name) == "" || execute == nil {
-		return nil, fmt.Errorf("Eino tool name and executor are required")
+func newEinoFunctionToolWithAliases(definition ai.ToolDefinition, aliases *einoToolAliasMap, execute ai.ToolCallExecutor) (*einoFunctionTool, error) {
+	providerName := definition.Name
+	if providerName == "" || execute == nil || aliases == nil {
+		return nil, fmt.Errorf("Eino provider tool name, alias map, and executor are required")
+	}
+	if _, ok := aliases.internalName(providerName); !ok {
+		return nil, fmt.Errorf("Eino provider tool name is not mapped")
 	}
 	info := &schema.ToolInfo{
-		Name: strings.TrimSpace(definition.Name),
+		Name: providerName,
 		Desc: strings.TrimSpace(definition.Description),
 	}
 	if len(definition.Parameters) > 0 {
@@ -135,7 +270,7 @@ func newEinoFunctionTool(definition ai.ToolDefinition, execute ai.ToolCallExecut
 		}
 		info.ParamsOneOf = schema.NewParamsOneOfByJSONSchema(&params)
 	}
-	return &einoFunctionTool{info: info, execute: execute}, nil
+	return &einoFunctionTool{info: info, providerName: providerName, aliases: aliases, execute: execute}, nil
 }
 
 func (t *einoFunctionTool) Info(context.Context) (*schema.ToolInfo, error) {
@@ -143,7 +278,11 @@ func (t *einoFunctionTool) Info(context.Context) (*schema.ToolInfo, error) {
 }
 
 func (t *einoFunctionTool) InvokableRun(ctx context.Context, arguments string, _ ...einotool.Option) (string, error) {
-	result, err := t.execute(ctx, ai.ToolCall{Name: t.info.Name, Arguments: arguments})
+	internalName, ok := t.aliases.internalName(t.providerName)
+	if !ok {
+		return "", fmt.Errorf("unknown provider tool alias")
+	}
+	result, err := t.execute(ctx, ai.ToolCall{Name: internalName, Arguments: arguments})
 	if err == nil {
 		return result, nil
 	}

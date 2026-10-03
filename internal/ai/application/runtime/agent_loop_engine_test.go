@@ -386,3 +386,22 @@ func jsonInt64List(id int64) string {
 	data, _ := json.Marshal([]int64{id})
 	return strings.Trim(string(data), "[]")
 }
+func TestAgentLoopToolDefinitionsPreserveReservedNameCollisions(t *testing.T) {
+	turn := agentLoopTurn{AllowedTools: []string{"tool_search", "conversation_decision"}}
+	definitions := append(agentLoopToolDefinitions(turn), agentLoopDecisionTool)
+	counts := make(map[string]int)
+	for _, definition := range definitions {
+		counts[definition.Name]++
+	}
+	for _, reserved := range []string{"tool_search", "conversation_decision"} {
+		if counts[reserved] != 2 {
+			t.Errorf("reserved identity %q was silently removed or not included in the complete tool set: count=%d definitions=%#v", reserved, counts[reserved], definitions)
+		}
+	}
+	_, _, err := buildEinoToolSet(definitions, func(context.Context, ai.ToolCall) (string, error) {
+		return "ok", nil
+	})
+	if err == nil {
+		t.Fatal("a capability colliding with a reserved provider name must fail before Eino registration")
+	}
+}

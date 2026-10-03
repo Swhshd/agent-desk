@@ -530,12 +530,9 @@ var (
 	}
 )
 
-// agentLoopToolDefinitions registers the capability codes as compatibility
-// aliases in addition to tool_search. Some OpenAI-compatible providers invoke
-// a capability code mentioned in the prompt directly instead of wrapping it in
-// tool_search. Eino validates the function name before our executor runs, so
-// those calls must be registered here and then routed through the same policy
-// boundary below.
+// agentLoopToolDefinitions registers a direct function for each capability in
+// addition to tool_search. The Eino adapter assigns provider-safe names; direct
+// function calls still enter the same policy boundary below.
 func agentLoopToolDefinitions(turn agentLoopTurn) []ai.ToolDefinition {
 	definitions := []ai.ToolDefinition{agentLoopToolSearchTool}
 	seen := map[string]struct{}{"tool_search": {}}
@@ -544,7 +541,7 @@ func agentLoopToolDefinitions(turn agentLoopTurn) []ai.ToolDefinition {
 		if code == "" {
 			continue
 		}
-		if _, exists := seen[code]; exists {
+		if _, exists := seen[code]; exists && code != agentLoopToolSearchTool.Name {
 			continue
 		}
 		seen[code] = struct{}{}
