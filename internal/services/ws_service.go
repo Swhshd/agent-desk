@@ -2,7 +2,6 @@ package services
 
 import (
 	"agent-desk/internal/models"
-	"agent-desk/internal/pkg/constants"
 	"agent-desk/internal/pkg/dto"
 	"agent-desk/internal/pkg/dto/response"
 	"agent-desk/internal/pkg/enums"
@@ -14,7 +13,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -572,9 +570,15 @@ func (s *wsService) defaultTopics(session *ClientSession) []string {
 		return []string{s.notificationTopic(session.Principal.UserID)}
 	case realtimeRoleAdmin:
 		if session.Principal == nil || session.Principal.UserID <= 0 {
-			return []string{realtimeTopicAdminAll}
+			return nil
 		}
-		return []string{s.adminTopic(session.Principal.UserID), realtimeTopicAdminAll}
+		var topics []string
+		for _, candidateTopic := range []string{s.adminTopic(session.Principal.UserID), realtimeTopicAdminAll} {
+			if s.CanSubscribeTopic(session, candidateTopic) {
+				topics = append(topics, candidateTopic)
+			}
+		}
+		return topics
 	default:
 		// 开放 IM：仅 External、无 AuthPrincipal 的访客连接必须仍能订阅 guest:{externalId}，否则收不到推送。
 		if session.External != nil && strings.TrimSpace(session.External.ExternalID) != "" {
@@ -598,9 +602,13 @@ func (s *wsService) filterAllowedTopics(session *ClientSession, topics []string)
 			return nil
 		}
 	case realtimeRoleAdmin:
-		if session.Principal == nil {
-			return nil
+		var allowed []string
+		for _, candidateTopic := range normalized {
+			if s.CanSubscribeTopic(session, candidateTopic) {
+				allowed = append(allowed, candidateTopic)
+			}
 		}
+		return allowed
 	default:
 		hasUser := session.Principal != nil && session.Principal.UserID > 0
 		hasExternal := session.External != nil && strings.TrimSpace(session.External.ExternalID) != ""
@@ -628,13 +636,7 @@ func (s *wsService) canSubscribeConversation(session *ClientSession, conversatio
 		return false
 	}
 	if session.Role == realtimeRoleAdmin {
-		// Staff sessions must hold the same conversation-view permission the
-		// REST endpoints require; a bare admin-role websocket must not become
-		// a side channel around RequirePermission.
-		if session.Principal != nil && slices.Contains(session.Principal.Permissions, constants.PermissionConversationView.Code) {
-			return true
-		}
-		return false
+		return s.CanSubscribeTopic(session, s.conversationTopic(conversationID))
 	}
 	conversation := ConversationService.Get(conversationID)
 	if conversation == nil {
