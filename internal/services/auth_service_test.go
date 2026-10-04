@@ -2,12 +2,15 @@ package services
 
 import (
 	"errors"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"agent-desk/internal/models"
 	"agent-desk/internal/pkg/config"
+	"agent-desk/internal/pkg/dto"
 	"agent-desk/internal/pkg/dto/request"
 	"agent-desk/internal/pkg/enums"
 	"agent-desk/internal/pkg/errorsx"
@@ -16,6 +19,7 @@ import (
 	"github.com/mlogclub/simple/sqls"
 	"github.com/mlogclub/simple/web"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
@@ -518,4 +522,227 @@ func hasCode(err error, code int) bool {
 		return codeErr.Code == code
 	}
 	return false
+}
+
+type rbacGrantFixture struct {
+	UserID, RoleID, PermissionID int64
+}
+
+func createRBACTestGrant(t *testing.T, db *gorm.DB, permissionCode string, roleStatus, permissionStatus enums.Status, includeRole bool, effect *int, expiredAt *time.Time) rbacGrantFixture {
+	t.Helper()
+	unique := t.Name() + ":" + permissionCode
+	user := createAuthTestUser(t, db, unique, "synthetic-rbac-password")
+	if err := db.Model(user).Update("user_type", enums.UserTypeEmployee).Error; err != nil {
+		t.Fatalf("set employee type: %v", err)
+	}
+	role := &models.Role{Code: "rbac:" + unique, Name: "RBAC fixture", Status: roleStatus}
+	permission := &models.Permission{Code: permissionCode, Status: permissionStatus}
+	for _, row := range []any{role, permission} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatalf("create RBAC definition: %v", err)
+		}
+	}
+	if includeRole {
+		if err := db.Create(&models.UserRole{UserID: user.ID, RoleID: role.ID}).Error; err != nil {
+			t.Fatalf("create user role: %v", err)
+		}
+	}
+	if err := db.Create(&models.RolePermission{RoleID: role.ID, PermissionID: permission.ID}).Error; err != nil {
+		t.Fatalf("create role permission: %v", err)
+	}
+	if effect != nil {
+		override := &models.UserPermission{UserID: user.ID, PermissionID: permission.ID, Effect: *effect, ExpiredAt: expiredAt}
+		if err := db.Create(override).Error; err != nil {
+			t.Fatalf("create direct override: %v", err)
+		}
+		// GORM applies default:1 to zero values during Create.
+		if *effect == 0 {
+			if err := db.Model(override).Update("effect", 0).Error; err != nil {
+				t.Fatalf("preserve zero effect: %v", err)
+			}
+		}
+	}
+	return rbacGrantFixture{UserID: user.ID, RoleID: role.ID, PermissionID: permission.ID}
+}
+
+func TestRBACEffectivePermissionFiltering(t *testing.T) {
+	allow, deny, negative, zero := 1, -1, -2, 0
+	past, future := time.Now().Add(-time.Hour), time.Now().Add(time.Hour)
+	cases := []struct {
+		name                         string
+		roleStatus, permissionStatus enums.Status
+		includeRole                  bool
+		effect                       *int
+		expiredAt                    *time.Time
+		want                         []string
+	}{
+		{"enabled role and permission", enums.StatusOk, enums.StatusOk, true, nil, nil, []string{"conversation.view"}},
+		{"disabled role", enums.StatusDisabled, enums.StatusOk, true, nil, nil, []string{}},
+		{"deleted role", enums.StatusDeleted, enums.StatusOk, true, nil, nil, []string{}},
+		{"disabled role permission", enums.StatusOk, enums.StatusDisabled, true, nil, nil, []string{}},
+		{"deleted role permission", enums.StatusOk, enums.StatusDeleted, true, nil, nil, []string{}},
+		{"direct allow without role", enums.StatusDisabled, enums.StatusOk, false, &allow, nil, []string{"conversation.view"}},
+		{"disabled direct allow", enums.StatusOk, enums.StatusDisabled, false, &allow, nil, []string{}},
+		{"deleted direct allow", enums.StatusOk, enums.StatusDeleted, false, &allow, nil, []string{}},
+		{"past expiry", enums.StatusOk, enums.StatusOk, false, &allow, &past, []string{}},
+		{"future expiry", enums.StatusOk, enums.StatusOk, false, &allow, &future, []string{"conversation.view"}},
+		{"null expiry", enums.StatusOk, enums.StatusOk, false, &allow, nil, []string{"conversation.view"}},
+		{"role and direct deny", enums.StatusOk, enums.StatusOk, true, &deny, nil, []string{}},
+		{"negative effect", enums.StatusOk, enums.StatusOk, true, &negative, nil, []string{}},
+		{"zero effect", enums.StatusOk, enums.StatusOk, false, &zero, nil, []string{"conversation.view"}},
+		{"positive effect deduplicates role", enums.StatusOk, enums.StatusOk, true, &allow, nil, []string{"conversation.view"}},
+		{"expired deny preserves role", enums.StatusOk, enums.StatusOk, true, &deny, &past, []string{"conversation.view"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupAuthServiceTestDB(t)
+			fixture := createRBACTestGrant(t, db, "conversation.view", tc.roleStatus, tc.permissionStatus, tc.includeRole, tc.effect, tc.expiredAt)
+			got, err := newAuthService().loadUserPermissionCodes(db, fixture.UserID)
+			if err != nil {
+				t.Fatalf("effective-permission query failed: %v", err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("permissions=%v want=%v", got, tc.want)
+			}
+		})
+	}
+	t.Run("sorted union and dedup", func(t *testing.T) {
+		db := setupAuthServiceTestDB(t)
+		fixture := createRBACTestGrant(t, db, "conversation.view", enums.StatusOk, enums.StatusOk, true, &allow, nil)
+		second := createRBACTestGrant(t, db, "aaa.synthetic", enums.StatusOk, enums.StatusOk, true, nil, nil)
+		if err := db.Create(&models.UserRole{UserID: fixture.UserID, RoleID: second.RoleID}).Error; err != nil {
+			t.Fatal(err)
+		}
+		// A second role grants the same code to exercise DISTINCT and final dedup.
+		if err := db.Create(&models.RolePermission{RoleID: second.RoleID, PermissionID: fixture.PermissionID}).Error; err != nil {
+			t.Fatal(err)
+		}
+		got, err := newAuthService().loadUserPermissionCodes(db, fixture.UserID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"aaa.synthetic", "conversation.view"}; !slices.Equal(got, want) {
+			t.Fatalf("permissions=%v want=%v", got, want)
+		}
+	})
+}
+
+func TestRBACActiveOverrideSelection(t *testing.T) {
+	db := setupAuthServiceTestDB(t)
+	now := time.Date(2026, 10, 4, 4, 0, 0, 0, time.UTC)
+	past, future := now.Add(-time.Second), now.Add(time.Second)
+	allow, deny, zero := 1, -1, 0
+	cases := []struct {
+		code   string
+		status enums.Status
+		effect *int
+		expiry *time.Time
+	}{
+		{"pr2.disabled.allow", enums.StatusDisabled, &allow, nil},
+		{"pr2.disabled.deny", enums.StatusDisabled, &deny, nil},
+		{"pr2.deleted.allow", enums.StatusDeleted, &allow, nil},
+		{"pr2.enabled.deny", enums.StatusOk, &deny, nil},
+		{"pr2.enabled.zero", enums.StatusOk, &zero, nil},
+		{"pr2.enabled.null", enums.StatusOk, &allow, nil},
+		{"pr2.enabled.future", enums.StatusOk, &allow, &future},
+		{"pr2.enabled.equal", enums.StatusOk, &allow, &now},
+		{"pr2.enabled.past", enums.StatusOk, &allow, &past},
+	}
+	var userID int64
+	for _, tc := range cases {
+		fixture := createRBACTestGrant(t, db, tc.code, enums.StatusOk, tc.status, false, tc.effect, tc.expiry)
+		if userID == 0 {
+			userID = fixture.UserID
+		}
+		if err := db.Model(&models.UserPermission{}).Where("user_id = ?", fixture.UserID).Update("user_id", userID).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rows []userPermissionOverride
+	if err := activeUserPermissionOverridesQuery(db, userID, now).Scan(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[string]int)
+	for _, row := range rows {
+		if _, exists := got[row.Code]; exists {
+			t.Fatalf("duplicate override %q", row.Code)
+		}
+		got[row.Code] = row.Effect
+	}
+	want := map[string]int{"pr2.enabled.deny": -1, "pr2.enabled.zero": 0, "pr2.enabled.null": 1, "pr2.enabled.future": 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("selected overrides=%v want=%v", got, want)
+	}
+}
+
+func TestRBACSQLDialectCompatibility(t *testing.T) {
+	now := time.Date(2026, 10, 4, 4, 0, 0, 0, time.UTC)
+	const userID int64 = 42
+	for _, tc := range []struct {
+		name      string
+		dialector gorm.Dialector
+	}{
+		{"sqlite", sqlite.Open(":memory:")},
+		{"mysql", mysql.New(mysql.Config{DSN: "rbac_dry_run@tcp(127.0.0.1:1)/rbac?parseTime=true", SkipInitializeWithVersion: true})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := gorm.Open(tc.dialector, &gorm.Config{DryRun: true, DisableAutomaticPing: true})
+			if err != nil {
+				t.Fatalf("open dry-run dialect: %v", err)
+			}
+			role := rolePermissionCodesQuery(db, userID).Find(&[]struct{ Code string }{})
+			if role.Error != nil {
+				t.Fatal(role.Error)
+			}
+			roleSQL := role.Statement.SQL.String()
+			for _, fragment := range []string{"DISTINCT p.code", "JOIN t_role_permission AS rp ON rp.permission_id = p.id", "JOIN t_user_role AS ur ON ur.role_id = rp.role_id", "JOIN t_role AS r ON r.id = rp.role_id", "ur.user_id = ?", "p.status = ?", "r.status = ?"} {
+				if !strings.Contains(roleSQL, fragment) {
+					t.Fatalf("role SQL missing %q: %s", fragment, roleSQL)
+				}
+			}
+			if want := []any{userID, enums.StatusOk, enums.StatusOk}; !reflect.DeepEqual(role.Statement.Vars, want) {
+				t.Fatalf("role vars=%v want=%v", role.Statement.Vars, want)
+			}
+			direct := activeUserPermissionOverridesQuery(db, userID, now).Find(&[]userPermissionOverride{})
+			if direct.Error != nil {
+				t.Fatal(direct.Error)
+			}
+			directSQL := direct.Statement.SQL.String()
+			for _, fragment := range []string{"p.code, up.effect", "JOIN t_permission AS p ON p.id = up.permission_id", "up.user_id = ?", "up.expired_at IS NULL OR up.expired_at > ?", "p.status = ?"} {
+				if !strings.Contains(directSQL, fragment) {
+					t.Fatalf("direct SQL missing %q: %s", fragment, directSQL)
+				}
+			}
+			if want := []any{userID, now, enums.StatusOk}; !reflect.DeepEqual(direct.Statement.Vars, want) {
+				t.Fatalf("direct vars=%v want=%v", direct.Statement.Vars, want)
+			}
+		})
+	}
+}
+
+func TestRBACFreshAuthScopeAfterRoleDisable(t *testing.T) {
+	db := setupAuthServiceTestDB(t)
+	fixture := createRBACTestGrant(t, db, "conversation.view", enums.StatusOk, enums.StatusOk, true, nil, nil)
+	svc := newAuthService()
+	roles, permissions, err := svc.loadUserAuthScope(db, fixture.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roles) != 1 || !slices.Equal(permissions, []string{"conversation.view"}) {
+		t.Fatalf("initial scope roles=%v permissions=%v", roles, permissions)
+	}
+	snapshot := &dto.AuthPrincipal{UserID: fixture.UserID, Roles: slices.Clone(roles), Permissions: slices.Clone(permissions)}
+	if err := RoleService.UpdateStatus(fixture.RoleID, enums.StatusDisabled, &dto.AuthPrincipal{UserID: fixture.UserID, Username: "synthetic-operator"}); err != nil {
+		t.Fatalf("disable role: %v", err)
+	}
+	freshRoles, freshPermissions, err := svc.loadUserAuthScope(db, fixture.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(freshRoles) != 0 || len(freshPermissions) != 0 {
+		t.Fatalf("fresh scope roles=%v permissions=%v", freshRoles, freshPermissions)
+	}
+	if !slices.Equal(snapshot.Roles, roles) || !slices.Equal(snapshot.Permissions, []string{"conversation.view"}) {
+		t.Fatalf("existing snapshot mutated: roles=%v permissions=%v", snapshot.Roles, snapshot.Permissions)
+	}
 }
