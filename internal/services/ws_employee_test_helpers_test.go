@@ -3,19 +3,15 @@ package services
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"agent-desk/internal/models"
 	"agent-desk/internal/pkg/dto"
 	"agent-desk/internal/pkg/enums"
-	"github.com/glebarez/sqlite"
-	"github.com/mlogclub/simple/sqls"
 	"gorm.io/gorm"
-	"gorm.io/gorm/schema"
 )
 
 type capturedRealtimeEvent struct {
@@ -26,44 +22,19 @@ type capturedRealtimeEvent struct {
 	Data    map[string]any `json:"data"`
 }
 
-var employeePublicationFallback struct {
-	once sync.Once
-	db   *gorm.DB
-	err  error
-}
-
-// The asynchronous assignment handlers may already hold one of these pointers
-// when the case restores the global DB. Retain only synthetic in-memory handles
-// until process exit; each case still has its own uniquely named database.
-var employeePublicationRetainedDBs []*gorm.DB
-var employeePublicationDBSequence atomic.Uint64
-
-// Assignment callbacks can start after a per-case fixture is restored. Keep a
-// live empty database for their initial lookup until the test process exits.
-func employeePublicationFallbackDB(t *testing.T) *gorm.DB {
-	t.Helper()
-	employeePublicationFallback.once.Do(func() {
-		employeePublicationFallback.db, employeePublicationFallback.err = gorm.Open(sqlite.Open("file:employee_realtime_callback_fallback?mode=memory&cache=shared"), &gorm.Config{
-			NamingStrategy: schema.NamingStrategy{TablePrefix: "t_", SingularTable: true},
-		})
-		if employeePublicationFallback.err == nil {
-			employeePublicationFallback.err = employeePublicationFallback.db.AutoMigrate(humanDispatchRealtimeTestModels()...)
-		}
-	})
-	if employeePublicationFallback.err != nil {
-		t.Fatal(employeePublicationFallback.err)
-	}
-	return employeePublicationFallback.db
-}
+var employeePublicationFixtureInstalled bool
 
 func setupEmployeePublicationTest(t *testing.T) (*gorm.DB, *wsService) {
 	t.Helper()
-	sqls.SetDB(employeePublicationFallbackDB(t))
-	previousDB, previousWs, previousHook := sqls.DB(), WsService, TriggerAIReplyAsyncHook
-	db := setupPersistentHumanDispatchRealtimeTestDB(t)
+	if os.Getenv(employeePublicationChildEnv) != t.Name() || employeePublicationFixtureInstalled {
+		t.Fatal("publication fixture requires a fresh child process for this case")
+	}
+	employeePublicationFixtureInstalled = true
+	db := openHumanDispatchRealtimeTestDB(t, true)
 	WsService = newWsService()
 	TriggerAIReplyAsyncHook = nil
-	t.Cleanup(func() { sqls.SetDB(previousDB); WsService = previousWs; TriggerAIReplyAsyncHook = previousHook })
+	// Keep the sole fixture and globals installed through child exit: asynchronous
+	// assignment callbacks may still resolve them after t.Cleanup would run.
 	return db, WsService
 }
 

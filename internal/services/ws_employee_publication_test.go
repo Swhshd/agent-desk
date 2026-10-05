@@ -20,6 +20,9 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 	}
 	for _, family := range families {
 		t.Run(family, func(t *testing.T) {
+			if runEmployeePublicationSubprocess(t) {
+				return
+			}
 			db, svc := setupEmployeePublicationTest(t)
 			ai := createWelcomeTestAIAgent(t, db, "")
 			if family == "create welcome" {

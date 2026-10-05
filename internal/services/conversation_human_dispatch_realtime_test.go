@@ -2,7 +2,8 @@ package services
 
 import (
 	"encoding/json"
-	"fmt"
+	"log"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,10 +15,14 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/mlogclub/simple/sqls"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
 )
 
 func TestAIHandoffPublishesFinalAssignedConversationEvent(t *testing.T) {
+	if runEmployeePublicationSubprocess(t) {
+		return
+	}
 	db, _ := setupEmployeePublicationTest(t)
 	session := captureHumanDispatchRealtimeSession(t, "admin:101", "admin:all")
 	denied := captureEmployeeRealtimeSession(t, WsService, "denied", nil, "admin:101", "admin:all")
@@ -52,6 +57,9 @@ func TestAIHandoffPublishesFinalAssignedConversationEvent(t *testing.T) {
 }
 
 func TestAIHandoffPublishesFinalTeamPoolConversationEvent(t *testing.T) {
+	if runEmployeePublicationSubprocess(t) {
+		return
+	}
 	db, _ := setupEmployeePublicationTest(t)
 	session := captureHumanDispatchRealtimeSession(t, "admin:all")
 	denied := captureEmployeeRealtimeSession(t, WsService, "denied", nil, "admin:all")
@@ -139,26 +147,25 @@ func setupHumanDispatchRealtimeTestDB(t *testing.T) *gorm.DB {
 	return openHumanDispatchRealtimeTestDB(t, false)
 }
 
-func setupPersistentHumanDispatchRealtimeTestDB(t *testing.T) *gorm.DB {
-	return openHumanDispatchRealtimeTestDB(t, true)
-}
-
-func openHumanDispatchRealtimeTestDB(t *testing.T, retainForCallbacks bool) *gorm.DB {
+func openHumanDispatchRealtimeTestDB(t *testing.T, publicationChild bool) *gorm.DB {
 	t.Helper()
 	dbName := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
-	if retainForCallbacks {
-		dbName = fmt.Sprintf("%s_%d", dbName, employeePublicationDBSequence.Add(1))
-	}
-	db, err := gorm.Open(sqlite.Open("file:"+dbName+"?mode=memory&cache=shared"), &gorm.Config{
+	config := &gorm.Config{
 		NamingStrategy: schema.NamingStrategy{
 			TablePrefix:   "t_",
 			SingularTable: true,
 		},
-	})
+	}
+	if publicationChild {
+		config.Logger = logger.New(log.New(os.Stdout, "", log.LstdFlags), logger.Config{
+			LogLevel: logger.Warn, IgnoreRecordNotFoundError: true,
+		})
+	}
+	db, err := gorm.Open(sqlite.Open("file:"+dbName+"?mode=memory&cache=shared"), config)
 	if err != nil {
 		t.Fatalf("open sqlite error = %v", err)
 	}
-	if !retainForCallbacks {
+	if !publicationChild {
 		t.Cleanup(func() {
 			sqlDB, err := db.DB()
 			if err == nil {
@@ -168,9 +175,6 @@ func openHumanDispatchRealtimeTestDB(t *testing.T, retainForCallbacks bool) *gor
 	}
 	if err := db.AutoMigrate(humanDispatchRealtimeTestModels()...); err != nil {
 		t.Fatalf("auto migrate error = %v", err)
-	}
-	if retainForCallbacks {
-		employeePublicationRetainedDBs = append(employeePublicationRetainedDBs, db)
 	}
 	sqls.SetDB(db)
 	return db
