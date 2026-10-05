@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,28 @@ import (
 	"gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
 )
+
+func TestEmployeePublicationLoggerPreservesSlowQueryWarnings(t *testing.T) {
+	if runEmployeePublicationSubprocess(t) {
+		return
+	}
+	db, _ := setupEmployeePublicationTest(t)
+	// The pinned GORM logger embeds its exported Config; inspect the actual
+	// fixture logger without replacing the process-wide stdout writer.
+	config, ok := reflect.ValueOf(db.Logger).Elem().FieldByName("Config").Interface().(logger.Config)
+	if !ok {
+		t.Fatal("publication fixture logger does not expose GORM logger.Config")
+	}
+	if config.SlowThreshold != 200*time.Millisecond {
+		t.Errorf("publication logger SlowThreshold = %v, want 200ms", config.SlowThreshold)
+	}
+	if config.LogLevel != logger.Warn {
+		t.Errorf("publication logger LogLevel = %v, want Warn", config.LogLevel)
+	}
+	if !config.IgnoreRecordNotFoundError {
+		t.Error("publication logger must ignore expected record-not-found errors")
+	}
+}
 
 func TestAIHandoffPublishesFinalAssignedConversationEvent(t *testing.T) {
 	if runEmployeePublicationSubprocess(t) {
@@ -158,7 +181,9 @@ func openHumanDispatchRealtimeTestDB(t *testing.T, publicationChild bool) *gorm.
 	}
 	if publicationChild {
 		config.Logger = logger.New(log.New(os.Stdout, "", log.LstdFlags), logger.Config{
-			LogLevel: logger.Warn, IgnoreRecordNotFoundError: true,
+			SlowThreshold:             200 * time.Millisecond,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
 		})
 	}
 	db, err := gorm.Open(sqlite.Open("file:"+dbName+"?mode=memory&cache=shared"), config)
