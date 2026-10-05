@@ -2,7 +2,6 @@ package services
 
 import (
 	"agent-desk/internal/models"
-	"agent-desk/internal/pkg/constants"
 	"agent-desk/internal/pkg/dto"
 	"agent-desk/internal/pkg/dto/response"
 	"agent-desk/internal/pkg/enums"
@@ -14,7 +13,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -509,26 +507,51 @@ func (s *wsService) PublishToTopics(topics []string, event RealtimeEvent) {
 		return
 	}
 
-	targets := s.manager.FindByTopics(normalized)
-	if len(targets) == 0 {
+	deliveries := s.manager.FindDeliveries(normalized)
+	if len(deliveries) == 0 {
 		return
 	}
 
-	payload, err := json.Marshal(event)
-	if err != nil {
-		slog.Error("marshal realtime event failed", "error", err, "type", event.Type)
-		return
+	type selectedDelivery struct {
+		event    RealtimeEvent
+		topic    string
+		audience employeeRealtimeAudience
+	}
+	selected := make(map[*ClientSession]selectedDelivery)
+	class := classifyEmployeeRealtimeEvent(event.Type)
+	for _, delivery := range deliveries {
+		session, topic := delivery.Session, delivery.DeliveryTopic
+		variant, audience := event, employeeAudienceFull
+		if session.Role == realtimeRoleAdmin {
+			var allowed bool
+			variant, allowed = s.employeeEventForDelivery(session, topic, event)
+			if !allowed {
+				continue
+			}
+			audience = s.employeeDeliveryAudience(session, topic, class)
+		}
+		previous, exists := selected[session]
+		if !exists || audience > previous.audience || audience == previous.audience && topic < previous.topic {
+			selected[session] = selectedDelivery{event: variant, topic: topic, audience: audience}
+		}
 	}
 
-	for _, session := range targets {
+	for session, delivery := range selected {
+		payload, err := json.Marshal(delivery.event)
+		if err != nil {
+			slog.Error("marshal realtime event failed", "error", err, "type", event.Type)
+			continue
+		}
+		if session.Role == realtimeRoleAdmin && !s.CanReceiveEvent(session, delivery.topic, class) {
+			continue
+		}
 		if session.enqueue(payload) {
 			continue
 		}
 		slog.Warn("drop slow realtime client",
 			"connId", session.ID,
-			"role", session.Role,
 			"type", event.Type,
-			"topic", event.Topic,
+			"topic", delivery.topic,
 		)
 		go s.closeSession(session)
 	}
@@ -572,9 +595,15 @@ func (s *wsService) defaultTopics(session *ClientSession) []string {
 		return []string{s.notificationTopic(session.Principal.UserID)}
 	case realtimeRoleAdmin:
 		if session.Principal == nil || session.Principal.UserID <= 0 {
-			return []string{realtimeTopicAdminAll}
+			return nil
 		}
-		return []string{s.adminTopic(session.Principal.UserID), realtimeTopicAdminAll}
+		var topics []string
+		for _, candidateTopic := range []string{s.adminTopic(session.Principal.UserID), realtimeTopicAdminAll} {
+			if s.CanSubscribeTopic(session, candidateTopic) {
+				topics = append(topics, candidateTopic)
+			}
+		}
+		return topics
 	default:
 		// 开放 IM：仅 External、无 AuthPrincipal 的访客连接必须仍能订阅 guest:{externalId}，否则收不到推送。
 		if session.External != nil && strings.TrimSpace(session.External.ExternalID) != "" {
@@ -598,9 +627,13 @@ func (s *wsService) filterAllowedTopics(session *ClientSession, topics []string)
 			return nil
 		}
 	case realtimeRoleAdmin:
-		if session.Principal == nil {
-			return nil
+		var allowed []string
+		for _, candidateTopic := range normalized {
+			if s.CanSubscribeTopic(session, candidateTopic) {
+				allowed = append(allowed, candidateTopic)
+			}
 		}
+		return allowed
 	default:
 		hasUser := session.Principal != nil && session.Principal.UserID > 0
 		hasExternal := session.External != nil && strings.TrimSpace(session.External.ExternalID) != ""
@@ -628,13 +661,7 @@ func (s *wsService) canSubscribeConversation(session *ClientSession, conversatio
 		return false
 	}
 	if session.Role == realtimeRoleAdmin {
-		// Staff sessions must hold the same conversation-view permission the
-		// REST endpoints require; a bare admin-role websocket must not become
-		// a side channel around RequirePermission.
-		if session.Principal != nil && slices.Contains(session.Principal.Permissions, constants.PermissionConversationView.Code) {
-			return true
-		}
-		return false
+		return s.CanSubscribeTopic(session, s.conversationTopic(conversationID))
 	}
 	conversation := ConversationService.Get(conversationID)
 	if conversation == nil {

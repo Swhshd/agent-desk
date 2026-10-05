@@ -8,6 +8,11 @@ type WsConnectionManager struct {
 	topics   map[string]map[string]*ClientSession
 }
 
+type realtimeDeliveryTarget struct {
+	Session       *ClientSession
+	DeliveryTopic string
+}
+
 func newWsConnectionManager() *WsConnectionManager {
 	return &WsConnectionManager{
 		sessions: make(map[string]*ClientSession),
@@ -110,6 +115,21 @@ func (m *WsConnectionManager) HasTopic(topic string) bool {
 
 	sessions := m.topics[topic]
 	return len(sessions) > 0
+}
+
+// FindDeliveries preserves each registered session/destination pair so employee
+// authorization and audience selection can use the actual fan-out destination.
+func (m *WsConnectionManager) FindDeliveries(topics []string) []realtimeDeliveryTarget {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var ret []realtimeDeliveryTarget
+	for _, topic := range normalizeRealtimeTopics(topics) {
+		for _, session := range m.topics[topic] {
+			ret = append(ret, realtimeDeliveryTarget{Session: session, DeliveryTopic: topic})
+		}
+	}
+	return ret
 }
 
 func (m *WsConnectionManager) subscribeLocked(session *ClientSession, topic string) {

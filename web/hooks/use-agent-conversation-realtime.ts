@@ -4,16 +4,21 @@ import { useEffect, useRef } from "react"
 import { toast } from "sonner"
 
 import { createAdminWebSocketUrl } from "@/lib/api/admin"
-import { type AgentMessage } from "@/lib/api/agent"
-import { shouldReloadConversationListForRealtimePatch } from "@/lib/agent-conversation-realtime"
+import {
+  handleAgentMessageCreated,
+  isFullAgentMessageRecalledPayload,
+  shouldReloadConversationListForRealtimePatch,
+  type AgentMessageCreatedData,
+  type AgentMessageRecalledData,
+} from "@/lib/agent-conversation-realtime"
 import { readSession } from "@/lib/auth"
+import { IMConversationStatus } from "@/lib/generated/enums"
 import {
   normalizeRealtimeMessage,
   type RealtimeConversationPatch,
-  type RealtimeMessageCreatedPayload,
 } from "@/lib/im-realtime-state"
 import { createRealtimeConnectionManager } from "@/lib/realtime-connection"
-import { getNotificationBody, showNotification } from "@/lib/services/notification"
+import { showNotification } from "@/lib/services/notification"
 import { useAgentConversationsStore } from "@/lib/stores/agent-conversations"
 import { useI18n } from "@/i18n/provider"
 
@@ -21,12 +26,7 @@ type AgentRealtimeConnection = ReturnType<typeof createRealtimeConnectionManager
 type AgentRealtimeEnvelope = {
   eventId?: string
   type?: string
-  data?: RealtimeMessageCreatedPayload<AgentMessage> &
-    RealtimeConversationPatch & {
-      messageId?: number
-      recalledAt?: string
-      sendStatus?: number
-    }
+  data?: AgentMessageCreatedData & RealtimeConversationPatch & AgentMessageRecalledData
 }
 
 export function useAgentConversationRealtime() {
@@ -99,36 +99,36 @@ export function useAgentConversationRealtime() {
           }
 
           if (eventType === "message.created") {
-            const message = normalizeRealtimeMessage<AgentMessage>(payload)
-            if (!message) {
-              void store.resyncRealtimeData(conversationId).catch((error) => {
-                toast.error(error instanceof Error ? error.message : t("conversation.syncMessagesFailed"))
-              })
-              return
-            }
-            store.applyRealtimeMessageCreated(message)
-
-            const shouldNotify =
-              message.senderType === "customer" &&
-              payload?.status === 2 &&
-              (payload.currentAssigneeId ?? 0) > 0 &&
-              payload.currentAssigneeId === currentUserIdRef.current &&
-              typeof document !== "undefined" &&
-              document.visibilityState !== "visible"
-
-            if (shouldNotify) {
-              showNotification(t("conversation.newMessage"), getNotificationBody(message), () => {
-                void store.selectConversation(message.conversationId)
-              })
-            }
+            void handleAgentMessageCreated(payload, {
+              currentUserId: currentUserIdRef.current,
+              hidden: typeof document !== "undefined" && document.visibilityState !== "visible",
+              activeConversationStatus: IMConversationStatus.Active,
+            }, {
+              normalize: normalizeRealtimeMessage,
+              applyMessage: store.applyRealtimeMessageCreated,
+              refresh: store.resyncRealtimeData,
+              notify: (conversationId) => {
+                showNotification(t("conversation.newMessage"), t("conversation.newMessage"), () => {
+                  void store.selectConversation(conversationId)
+                })
+              },
+            }).catch((error) => {
+              toast.error(error instanceof Error ? error.message : t("conversation.syncMessagesFailed"))
+            })
             return
           }
 
           if (eventType === "message.recalled" && payload?.messageId) {
-            store.applyRealtimeMessageRecalled(payload.messageId, {
-              sendStatus: payload.sendStatus,
-              recalledAt: payload.recalledAt,
-            })
+            if (isFullAgentMessageRecalledPayload(payload)) {
+              store.applyRealtimeMessageRecalled(payload.messageId, {
+                sendStatus: payload.sendStatus,
+                recalledAt: payload.recalledAt,
+              })
+            } else {
+              void store.resyncRealtimeData(conversationId).catch((error) => {
+                toast.error(error instanceof Error ? error.message : t("conversation.syncMessagesFailed"))
+              })
+            }
             return
           }
 
