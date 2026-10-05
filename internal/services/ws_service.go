@@ -507,26 +507,51 @@ func (s *wsService) PublishToTopics(topics []string, event RealtimeEvent) {
 		return
 	}
 
-	targets := s.manager.FindByTopics(normalized)
-	if len(targets) == 0 {
+	deliveries := s.manager.FindDeliveries(normalized)
+	if len(deliveries) == 0 {
 		return
 	}
 
-	payload, err := json.Marshal(event)
-	if err != nil {
-		slog.Error("marshal realtime event failed", "error", err, "type", event.Type)
-		return
+	type selectedDelivery struct {
+		event    RealtimeEvent
+		topic    string
+		audience employeeRealtimeAudience
+	}
+	selected := make(map[*ClientSession]selectedDelivery)
+	class := classifyEmployeeRealtimeEvent(event.Type)
+	for _, delivery := range deliveries {
+		session, topic := delivery.Session, delivery.DeliveryTopic
+		variant, audience := event, employeeAudienceFull
+		if session.Role == realtimeRoleAdmin {
+			var allowed bool
+			variant, allowed = s.employeeEventForDelivery(session, topic, event)
+			if !allowed {
+				continue
+			}
+			audience = s.employeeDeliveryAudience(session, topic, class)
+		}
+		previous, exists := selected[session]
+		if !exists || audience > previous.audience || audience == previous.audience && topic < previous.topic {
+			selected[session] = selectedDelivery{event: variant, topic: topic, audience: audience}
+		}
 	}
 
-	for _, session := range targets {
+	for session, delivery := range selected {
+		payload, err := json.Marshal(delivery.event)
+		if err != nil {
+			slog.Error("marshal realtime event failed", "error", err, "type", event.Type)
+			continue
+		}
+		if session.Role == realtimeRoleAdmin && !s.CanReceiveEvent(session, delivery.topic, class) {
+			continue
+		}
 		if session.enqueue(payload) {
 			continue
 		}
 		slog.Warn("drop slow realtime client",
 			"connId", session.ID,
-			"role", session.Role,
 			"type", event.Type,
-			"topic", event.Topic,
+			"topic", delivery.topic,
 		)
 		go s.closeSession(session)
 	}

@@ -2,11 +2,13 @@ package services
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"agent-desk/internal/models"
+	"agent-desk/internal/pkg/dto"
 	"agent-desk/internal/pkg/enums"
 
 	"github.com/glebarez/sqlite"
@@ -16,9 +18,10 @@ import (
 )
 
 func TestAIHandoffPublishesFinalAssignedConversationEvent(t *testing.T) {
-	db := setupHumanDispatchRealtimeTestDB(t)
-	WsService = newWsService()
+	db, _ := setupEmployeePublicationTest(t)
 	session := captureHumanDispatchRealtimeSession(t, "admin:101", "admin:all")
+	denied := captureEmployeeRealtimeSession(t, WsService, "denied", nil, "admin:101", "admin:all")
+	noView := captureEmployeeRealtimeSession(t, WsService, "no-view", &dto.AuthPrincipal{UserID: 101}, "admin:101", "admin:all")
 	aiAgent := createHumanDispatchRealtimeAIAgent(t, db, "1")
 	createHumanDispatchRealtimeTeam(t, db, 1)
 	createHumanDispatchRealtimeActiveSchedule(t, db, 1)
@@ -34,6 +37,9 @@ func TestAIHandoffPublishesFinalAssignedConversationEvent(t *testing.T) {
 	}
 
 	event := findHumanDispatchRealtimeEvent(t, session, enums.IMRealtimeEventConversationAssigned)
+	assertEmployeeQueueData(t, capturedRealtimeEvent{Data: event.Data}, employeeConversationQueueKeys)
+	requireNoCapturedRealtimeEvent(t, denied)
+	requireNoCapturedRealtimeEvent(t, noView)
 	if event.Data["conversationId"] != float64(conversation.ID) {
 		t.Fatalf("unexpected conversation id in event: %+v", event.Data)
 	}
@@ -46,9 +52,10 @@ func TestAIHandoffPublishesFinalAssignedConversationEvent(t *testing.T) {
 }
 
 func TestAIHandoffPublishesFinalTeamPoolConversationEvent(t *testing.T) {
-	db := setupHumanDispatchRealtimeTestDB(t)
-	WsService = newWsService()
+	db, _ := setupEmployeePublicationTest(t)
 	session := captureHumanDispatchRealtimeSession(t, "admin:all")
+	denied := captureEmployeeRealtimeSession(t, WsService, "denied", nil, "admin:all")
+	noView := captureEmployeeRealtimeSession(t, WsService, "no-view", &dto.AuthPrincipal{UserID: 101}, "admin:all")
 	aiAgent := createHumanDispatchRealtimeAIAgent(t, db, "1")
 	createHumanDispatchRealtimeTeam(t, db, 1)
 	createHumanDispatchRealtimeActiveSchedule(t, db, 1)
@@ -68,6 +75,9 @@ func TestAIHandoffPublishesFinalTeamPoolConversationEvent(t *testing.T) {
 	if event.Data["conversationId"] != float64(conversation.ID) {
 		t.Fatalf("unexpected conversation id in event: %+v", event.Data)
 	}
+	assertEmployeeQueueData(t, capturedRealtimeEvent{Data: event.Data}, employeeConversationQueueKeys)
+	requireNoCapturedRealtimeEvent(t, denied)
+	requireNoCapturedRealtimeEvent(t, noView)
 	if event.Data["status"] != float64(enums.IMConversationStatusPending) {
 		t.Fatalf("expected pending status in updated event, got %+v", event.Data["status"])
 	}
@@ -113,18 +123,32 @@ func findHumanDispatchRealtimeEvent(t *testing.T, session *ClientSession, eventT
 func captureHumanDispatchRealtimeSession(t *testing.T, topics ...string) *ClientSession {
 	t.Helper()
 	session := &ClientSession{
-		ID:     "test-session",
-		Role:   realtimeRoleAdmin,
-		Topics: map[string]struct{}{},
-		Send:   make(chan []byte, 32),
+		ID:        "test-session",
+		Role:      realtimeRoleAdmin,
+		Principal: employeeViewPrincipal(),
+		Topics:    map[string]struct{}{},
+		Send:      make(chan []byte, 32),
 	}
-	WsService.manager.Register(session, topics)
+	manager := WsService.manager
+	manager.Register(session, topics)
+	t.Cleanup(func() { manager.Unregister(session) })
 	return session
 }
 
 func setupHumanDispatchRealtimeTestDB(t *testing.T) *gorm.DB {
+	return openHumanDispatchRealtimeTestDB(t, false)
+}
+
+func setupPersistentHumanDispatchRealtimeTestDB(t *testing.T) *gorm.DB {
+	return openHumanDispatchRealtimeTestDB(t, true)
+}
+
+func openHumanDispatchRealtimeTestDB(t *testing.T, retainForCallbacks bool) *gorm.DB {
 	t.Helper()
 	dbName := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	if retainForCallbacks {
+		dbName = fmt.Sprintf("%s_%d", dbName, employeePublicationDBSequence.Add(1))
+	}
 	db, err := gorm.Open(sqlite.Open("file:"+dbName+"?mode=memory&cache=shared"), &gorm.Config{
 		NamingStrategy: schema.NamingStrategy{
 			TablePrefix:   "t_",
@@ -134,13 +158,26 @@ func setupHumanDispatchRealtimeTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite error = %v", err)
 	}
-	t.Cleanup(func() {
-		sqlDB, err := db.DB()
-		if err == nil {
-			_ = sqlDB.Close()
-		}
-	})
-	if err := db.AutoMigrate(
+	if !retainForCallbacks {
+		t.Cleanup(func() {
+			sqlDB, err := db.DB()
+			if err == nil {
+				_ = sqlDB.Close()
+			}
+		})
+	}
+	if err := db.AutoMigrate(humanDispatchRealtimeTestModels()...); err != nil {
+		t.Fatalf("auto migrate error = %v", err)
+	}
+	if retainForCallbacks {
+		employeePublicationRetainedDBs = append(employeePublicationRetainedDBs, db)
+	}
+	sqls.SetDB(db)
+	return db
+}
+
+func humanDispatchRealtimeTestModels() []any {
+	return []any{
 		&models.User{},
 		&models.Notification{},
 		&models.Customer{},
@@ -157,11 +194,7 @@ func setupHumanDispatchRealtimeTestDB(t *testing.T) *gorm.DB {
 		&models.ConversationReadState{},
 		&models.Message{},
 		&models.ChannelMessageOutbox{},
-	); err != nil {
-		t.Fatalf("auto migrate error = %v", err)
 	}
-	sqls.SetDB(db)
-	return db
 }
 
 func createHumanDispatchRealtimeAIAgent(t *testing.T, db *gorm.DB, teamIDs string) models.AIAgent {
