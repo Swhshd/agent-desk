@@ -252,10 +252,12 @@ func (s *wsService) closeSession(session *ClientSession) {
 		return
 	}
 	session.closeOnce.Do(func() {
+		session.sendMu.Lock()
 		session.Closed.Store(true)
-		remaining := s.manager.Unregister(session)
-
 		close(session.Send)
+		session.sendMu.Unlock()
+
+		remaining := s.manager.Unregister(session)
 		if session.Conn != nil {
 			_ = session.Conn.Close()
 		}
