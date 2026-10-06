@@ -574,8 +574,8 @@ func (s *wsService) routeConversationTopics(conversation *models.Conversation) [
 	}
 
 	topics := []string{s.conversationTopic(conversation.ID)}
-	if identity := ConversationService.GetConversationExternalIdentity(conversation); identity != nil && strings.TrimSpace(identity.ExternalID) != "" {
-		topics = append(topics, s.guestTopic(identity.ExternalID))
+	if conversation.CustomerID > 0 {
+		topics = append(topics, s.customerTopic(conversation.CustomerID))
 	}
 	if conversation.CurrentAssigneeID > 0 {
 		topics = append(topics, s.adminTopic(conversation.CurrentAssigneeID))
