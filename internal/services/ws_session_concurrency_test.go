@@ -2,11 +2,207 @@ package services
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
+	"net"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"agent-desk/internal/pkg/dto"
+	"agent-desk/internal/pkg/openidentity"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
+
+func TestWsSessionNormalDelivery(t *testing.T) {
+	service, peer, session := newWsPumpTestSocket(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.writePump(session)
+	}()
+	t.Cleanup(func() {
+		service.closeSession(session)
+		waitWsPumpDone(t, done, "writer")
+	})
+
+	payload := []byte("normal delivery")
+	if !session.enqueue(payload) {
+		t.Fatal("enqueue on open session = false, want true")
+	}
+	assertWsPeerText(t, peer, payload)
+}
+
+func TestWsWriterPumpTerminatesAfterSessionClose(t *testing.T) {
+	service, _, session := newWsPumpTestSocket(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.writePump(session)
+	}()
+	service.closeSession(session)
+	waitWsPumpDone(t, done, "writer")
+}
+
+func TestWsReaderPumpTerminatesAfterSessionClose(t *testing.T) {
+	service, peer, session := newWsPumpTestSocket(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.readPump(session)
+	}()
+	if err := peer.WriteJSON(map[string]string{"type": "ping"}); err != nil {
+		t.Fatalf("send reader pump probe: %v", err)
+	}
+	select {
+	case payload, ok := <-session.Send:
+		if !ok || !bytes.Contains(payload, []byte(`"type":"pong"`)) {
+			t.Fatalf("reader pump probe response = %q, open=%t; want pong", payload, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader pump did not process probe within two seconds")
+	}
+	service.closeSession(session)
+	waitWsPumpDone(t, done, "reader")
+}
+
+func TestWsSessionCloseAcrossHandlerRoles(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		role  string
+		topic string
+		open  func(*testing.T, *wsService) *websocket.Conn
+	}{
+		{
+			name: "dashboard employee", role: realtimeRoleAdmin, topic: "admin:101",
+			open: func(t *testing.T, service *wsService) *websocket.Conn {
+				return openWsDashboardPumpTestSocket(t, service, 101, service.HandleDashboardWS)
+			},
+		},
+		{
+			name: "dashboard notification", role: realtimeRoleNotification, topic: "notification:102",
+			open: func(t *testing.T, service *wsService) *websocket.Conn {
+				return openWsDashboardPumpTestSocket(t, service, 102, service.HandleDashboardNotificationWS)
+			},
+		},
+		{
+			name: "synthetic customer/open", role: realtimeRoleUser, topic: "customer:103",
+			open: func(t *testing.T, service *wsService) *websocket.Conn {
+				return openCustomerIdentityTestSocket(t, service, 103, &openidentity.ExternalUser{ExternalID: "pump-test-customer"})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service := newWsService()
+			peer := tc.open(t, service)
+			if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if messageType, _, err := peer.ReadMessage(); err != nil || messageType != websocket.TextMessage {
+				t.Fatalf("connected frame: type=%d, error=%v", messageType, err)
+			}
+			members := service.manager.FindByTopics([]string{tc.topic})
+			if len(members) != 1 || members[0].Role != tc.role {
+				t.Fatalf("registered %s sessions = %v, want one %s session", tc.topic, members, tc.role)
+			}
+			session := members[0]
+			t.Cleanup(func() { service.closeSession(session) })
+			payload := []byte("queued role delivery")
+			if !session.enqueue(payload) {
+				t.Fatal("enqueue on handler session = false, want true")
+			}
+			assertWsPeerText(t, peer, payload)
+
+			service.closeSession(session)
+			if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := peer.ReadMessage(); err == nil {
+				t.Fatal("peer read succeeded after server-side close")
+			} else {
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					t.Fatalf("peer read timed out after server-side close: %v", err)
+				}
+			}
+			if !session.Closed.Load() || len(service.manager.FindByTopics([]string{tc.topic})) != 0 {
+				t.Fatal("closed handler session remains open or registered")
+			}
+		})
+	}
+}
+
+func newWsPumpTestSocket(t *testing.T) (*wsService, *websocket.Conn, *ClientSession) {
+	t.Helper()
+	service := newWsService()
+	sessions := make(chan *ClientSession, 1)
+	router := gin.New()
+	router.GET("/ws", func(ctx *gin.Context) {
+		conn, err := service.upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
+		if err != nil {
+			return
+		}
+		sessions <- &ClientSession{Conn: conn, Topics: make(map[string]struct{}), Send: make(chan []byte, realtimeSendBufferSize)}
+	})
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	peer, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/ws", nil)
+	if err != nil {
+		t.Fatalf("pump test handshake: %v", err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	select {
+	case session := <-sessions:
+		t.Cleanup(func() { service.closeSession(session) })
+		return service, peer, session
+	case <-time.After(2 * time.Second):
+		t.Fatal("server-side Gorilla connection was not received")
+		return nil, nil, nil
+	}
+}
+
+func openWsDashboardPumpTestSocket(t *testing.T, service *wsService, userID int64, handler gin.HandlerFunc) *websocket.Conn {
+	t.Helper()
+	router := gin.New()
+	router.GET("/ws", func(ctx *gin.Context) {
+		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: userID})
+		handler(ctx)
+	})
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	peer, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dashboard handshake: %v", err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	return peer
+}
+
+func assertWsPeerText(t *testing.T, peer *websocket.Conn, want []byte) {
+	t.Helper()
+	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	messageType, got, err := peer.ReadMessage()
+	if err != nil {
+		t.Fatalf("read queued text: %v", err)
+	}
+	if messageType != websocket.TextMessage || !bytes.Equal(got, want) {
+		t.Fatalf("queued frame = (type %d, %q), want text %q", messageType, got, want)
+	}
+}
+
+func waitWsPumpDone(t *testing.T, done <-chan struct{}, pump string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s pump did not terminate within two seconds", pump)
+	}
+}
 
 func TestClientSessionEnqueueCharacterization(t *testing.T) {
 	var nilSession *ClientSession
