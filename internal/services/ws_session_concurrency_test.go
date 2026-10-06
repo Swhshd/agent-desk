@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -25,7 +26,7 @@ func TestWsSessionNormalDelivery(t *testing.T) {
 		service.writePump(session)
 	}()
 	t.Cleanup(func() {
-		service.closeSession(session)
+		closeWsSessionWithinDeadline(t, service, session)
 		waitWsPumpDone(t, done, "writer")
 	})
 
@@ -43,7 +44,7 @@ func TestWsWriterPumpTerminatesAfterSessionClose(t *testing.T) {
 		defer close(done)
 		service.writePump(session)
 	}()
-	service.closeSession(session)
+	closeWsSessionWithinDeadline(t, service, session)
 	waitWsPumpDone(t, done, "writer")
 }
 
@@ -54,6 +55,9 @@ func TestWsReaderPumpTerminatesAfterSessionClose(t *testing.T) {
 		defer close(done)
 		service.readPump(session)
 	}()
+	if err := peer.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	if err := peer.WriteJSON(map[string]string{"type": "ping"}); err != nil {
 		t.Fatalf("send reader pump probe: %v", err)
 	}
@@ -65,7 +69,7 @@ func TestWsReaderPumpTerminatesAfterSessionClose(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("reader pump did not process probe within two seconds")
 	}
-	service.closeSession(session)
+	closeWsSessionWithinDeadline(t, service, session)
 	waitWsPumpDone(t, done, "reader")
 }
 
@@ -96,6 +100,9 @@ func TestWsSessionCloseAcrossHandlerRoles(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// Keep role cases serial: the only new pump pair must belong to this
+			// one handler connection. Ambiguous observations fail the test.
+			before := waitWsGoroutineStacks(t, "initial snapshot", func(map[string]string) bool { return true })
 			service := newWsService()
 			peer := tc.open(t, service)
 			if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
@@ -109,14 +116,42 @@ func TestWsSessionCloseAcrossHandlerRoles(t *testing.T) {
 				t.Fatalf("registered %s sessions = %v, want one %s session", tc.topic, members, tc.role)
 			}
 			session := members[0]
-			t.Cleanup(func() { service.closeSession(session) })
+			t.Cleanup(func() { closeWsSessionWithinDeadline(t, service, session) })
 			payload := []byte("queued role delivery")
 			if !session.enqueue(payload) {
 				t.Fatal("enqueue on handler session = false, want true")
 			}
 			assertWsPeerText(t, peer, payload)
 
-			service.closeSession(session)
+			pumps := make(map[string]string)
+			waitWsGoroutineStacks(t, "handler pump startup", func(stacks map[string]string) bool {
+				clear(pumps)
+				counts := make(map[string]int)
+				for id, stack := range stacks {
+					if _, existed := before[id]; existed {
+						continue
+					}
+					if !strings.Contains(stack, "\ncreated by agent-desk/internal/services.(*wsService).upgradeConnection ") {
+						continue
+					}
+					for _, pump := range []string{"readPump", "writePump"} {
+						if strings.Contains(stack, "\nagent-desk/internal/services.(*wsService)."+pump+"(") {
+							pumps[id] = pump
+							counts[pump]++
+						}
+					}
+				}
+				return len(pumps) == 2 && counts["readPump"] == 1 && counts["writePump"] == 1
+			})
+			closeWsSessionWithinDeadline(t, service, session)
+			waitWsGoroutineStacks(t, "handler pump termination", func(stacks map[string]string) bool {
+				for id := range pumps {
+					if _, alive := stacks[id]; alive {
+						return false
+					}
+				}
+				return true
+			})
 			if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
@@ -156,7 +191,7 @@ func newWsPumpTestSocket(t *testing.T) (*wsService, *websocket.Conn, *ClientSess
 	t.Cleanup(func() { _ = peer.Close() })
 	select {
 	case session := <-sessions:
-		t.Cleanup(func() { service.closeSession(session) })
+		t.Cleanup(func() { closeWsSessionWithinDeadline(t, service, session) })
 		return service, peer, session
 	case <-time.After(2 * time.Second):
 		t.Fatal("server-side Gorilla connection was not received")
@@ -201,6 +236,69 @@ func waitWsPumpDone(t *testing.T, done <-chan struct{}, pump string) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("%s pump did not terminate within two seconds", pump)
+	}
+}
+
+func closeWsSessionWithinDeadline(t *testing.T, service *wsService, session *ClientSession) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.closeSession(session)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closeSession did not complete within two seconds")
+	}
+}
+
+// Observe full goroutine stacks rather than counts or socket effects. After
+// startup, requiring the captured IDs to disappear also covers deferred cleanup;
+// merely losing a pump frame is not sufficient evidence of goroutine exit.
+func waitWsGoroutineStacks(t *testing.T, operation string, ready func(map[string]string) bool) map[string]string {
+	t.Helper()
+	done := make(chan map[string]string, 1)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			buffer := make([]byte, 16*1024)
+			var n int
+			for {
+				n = runtime.Stack(buffer, true)
+				if n < len(buffer) {
+					break
+				}
+				buffer = make([]byte, len(buffer)*2)
+			}
+			stacks := make(map[string]string)
+			for _, stack := range strings.Split(string(buffer[:n]), "\n\n") {
+				header, _, _ := strings.Cut(stack, "\n")
+				fields := strings.Fields(header)
+				if len(fields) >= 2 && fields[0] == "goroutine" {
+					stacks[fields[1]] = stack
+				}
+			}
+			if ready(stacks) {
+				done <- stacks
+				return
+			}
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	select {
+	case stacks := <-done:
+		return stacks
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s was not observed within two seconds", operation)
+		return nil
 	}
 }
 
