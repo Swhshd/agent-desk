@@ -279,8 +279,15 @@ type ClientSession struct {
 }
 
 func (s *ClientSession) enqueue(payload []byte) bool {
+	return s.enqueueWithBeforeSend(payload, nil)
+}
+
+func (s *ClientSession) enqueueWithBeforeSend(payload []byte, beforeSend func()) bool {
 	if s == nil || s.Closed.Load() {
 		return false
+	}
+	if beforeSend != nil {
+		beforeSend()
 	}
 	select {
 	case s.Send <- payload:
