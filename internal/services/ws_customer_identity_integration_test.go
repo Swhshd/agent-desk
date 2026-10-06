@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -13,6 +14,8 @@ import (
 
 	"agent-desk/internal/models"
 	"agent-desk/internal/pkg/config"
+	"agent-desk/internal/pkg/constants"
+	"agent-desk/internal/pkg/dto"
 	"agent-desk/internal/pkg/enums"
 	"agent-desk/internal/pkg/openidentity"
 
@@ -198,6 +201,70 @@ func TestCustomerRealtimeIdentityRuntime(t *testing.T) {
 		readCustomerIdentityTestEvent(t, tc.owner, enums.IMRealtimeEventPong)
 		customerIdentityTestPing(t, tc.foreign)
 		readCustomerIdentityTestEvent(t, tc.foreign, enums.IMRealtimeEventPong)
+	}
+	// A stale explicit subscription must not retain full events after the
+	// application's customer-link operation transfers current ownership to B.
+	if err := a.WriteJSON(map[string]any{"type": "subscribe", "topics": []string{"conversation:501"}}); err != nil {
+		t.Fatal(err)
+	}
+	ack := readCustomerIdentityTestEvent(t, a, enums.IMRealtimeEventSubscribed)
+	if topics, ok := ack.Data["topics"].([]any); !ok || len(topics) != 1 || topics[0] != "conversation:501" {
+		t.Fatal("A's owned conversation subscription was not acknowledged")
+	}
+	if !slices.Contains(svc.manager.FindByTopics([]string{"conversation:501"}), sessionA) {
+		t.Fatal("A's owned conversation subscription was not registered")
+	}
+	previousWsService := WsService
+	WsService = svc
+	t.Cleanup(func() { WsService = previousWsService })
+	operator := &dto.AuthPrincipal{UserID: 701, Username: "synthetic-runtime-admin", Roles: []string{constants.RoleCodeAdmin}}
+	if err := ConversationService.LinkConversationCustomer(501, 42, operator); err != nil {
+		t.Fatalf("reassign synthetic conversation through service: %v", err)
+	}
+	reassigned := ConversationService.Get(501)
+	if reassigned == nil || reassigned.CustomerID != 42 {
+		t.Fatal("service did not reassign conversation to B")
+	}
+	updated := readCustomerIdentityTestEvent(t, b, enums.IMRealtimeEventConversationUpdated)
+	if updated.Topic != "conversation:501" || updated.Data["conversationId"] != float64(501) || updated.Data["status"] != float64(enums.IMConversationStatusAIServing) {
+		t.Fatal("B did not receive the reassigned conversation update")
+	}
+	customerIdentityTestPing(t, b)
+	readCustomerIdentityTestEvent(t, b, enums.IMRealtimeEventPong)
+	// Publish enqueues before ping; any protected event precedes the pong and fails.
+	assertAReceivesOnlyPong := func() {
+		t.Helper()
+		customerIdentityTestPing(t, a)
+		if err := a.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			_, body, err := a.ReadMessage()
+			if err != nil {
+				t.Fatalf("A did not remain connected for pong fence: %v", err)
+			}
+			var event capturedRealtimeEvent
+			if err := json.Unmarshal(body, &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Type == enums.IMRealtimeEventPong {
+				return
+			}
+			t.Errorf("former owner A received unauthorized event type=%q topic=%q conversationId=%v content=%v", event.Type, event.Topic, event.Data["conversationId"], event.Data["content"])
+		}
+	}
+	assertAReceivesOnlyPong()
+	marker := "CUSTOMER_WS_REASSIGNED_B_" + suffix
+	svc.PublishMessageCreated(reassigned, &models.Message{ID: 603, ConversationID: 501, SenderType: enums.IMSenderTypeCustomer, MessageType: enums.IMMessageTypeText, Content: marker})
+	message := readCustomerIdentityTestEvent(t, b, enums.IMRealtimeEventMessageCreated)
+	if message.Topic != "conversation:501" || message.Data["conversationId"] != float64(501) || message.Data["content"] != marker {
+		t.Fatal("B did not receive the full reassigned conversation message")
+	}
+	customerIdentityTestPing(t, b)
+	readCustomerIdentityTestEvent(t, b, enums.IMRealtimeEventPong)
+	assertAReceivesOnlyPong()
+	if !svc.IsCustomerOnline(41) || !slices.Contains(svc.manager.FindByTopics([]string{"conversation:501"}), sessionA) {
+		t.Fatal("delivery denial must leave A connected with its stale subscription")
 	}
 	closeAndWait := func(conn *websocket.Conn, session *ClientSession) {
 		t.Helper()

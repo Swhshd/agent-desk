@@ -524,6 +524,12 @@ func (s *wsService) PublishToTopics(topics []string, event RealtimeEvent) {
 	class := classifyEmployeeRealtimeEvent(event.Type)
 	for _, delivery := range deliveries {
 		session, topic := delivery.Session, delivery.DeliveryTopic
+		if session.Role == realtimeRoleUser && session.External != nil && strings.HasPrefix(topic, "conversation:") {
+			conversationID, ok := parseConversationTopic(topic)
+			if !ok || !s.canSubscribeConversation(session, conversationID) {
+				continue
+			}
+		}
 		variant, audience := event, employeeAudienceFull
 		if session.Role == realtimeRoleAdmin {
 			var allowed bool
