@@ -275,11 +275,24 @@ type ClientSession struct {
 	Send         chan []byte
 	Closed       atomic.Bool
 	LastActiveAt atomic.Int64
+	sendMu       sync.Mutex
 	closeOnce    sync.Once
 }
 
 func (s *ClientSession) enqueue(payload []byte) bool {
+	return s.enqueueWithBeforeSend(payload, nil)
+}
+
+func (s *ClientSession) enqueueWithBeforeSend(payload []byte, beforeSend func()) bool {
 	if s == nil || s.Closed.Load() {
+		return false
+	}
+	if beforeSend != nil {
+		beforeSend()
+	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.Closed.Load() {
 		return false
 	}
 	select {
