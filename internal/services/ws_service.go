@@ -608,9 +608,11 @@ func (s *wsService) defaultTopics(session *ClientSession) []string {
 		}
 		return topics
 	default:
-		// 开放 IM：仅 External、无 AuthPrincipal 的访客连接必须仍能订阅 guest:{externalId}，否则收不到推送。
-		if session.External != nil && strings.TrimSpace(session.External.ExternalID) != "" {
-			return []string{s.guestTopic(session.External.ExternalID)}
+		if session.External != nil {
+			if topic := s.customerTopic(session.CustomerID); topic != "" {
+				return []string{topic}
+			}
+			return nil
 		}
 		if session.Principal != nil && session.Principal.UserID > 0 {
 			return []string{s.userTopic(session.Principal.UserID)}
@@ -639,8 +641,7 @@ func (s *wsService) filterAllowedTopics(session *ClientSession, topics []string)
 		return allowed
 	default:
 		hasUser := session.Principal != nil && session.Principal.UserID > 0
-		hasExternal := session.External != nil && strings.TrimSpace(session.External.ExternalID) != ""
-		if !hasUser && !hasExternal {
+		if !hasUser && session.CustomerID <= 0 {
 			return nil
 		}
 	}
@@ -666,14 +667,14 @@ func (s *wsService) canSubscribeConversation(session *ClientSession, conversatio
 	if session.Role == realtimeRoleAdmin {
 		return s.CanSubscribeTopic(session, s.conversationTopic(conversationID))
 	}
+	if session.CustomerID <= 0 {
+		return false
+	}
 	conversation := ConversationService.Get(conversationID)
 	if conversation == nil {
 		return false
 	}
-	if session.External != nil {
-		return ConversationService.IsCustomerConversationOwner(conversation, *session.External)
-	}
-	return false
+	return conversation.CustomerID == session.CustomerID
 }
 
 func (s *wsService) resolveTerminalType(ctx *gin.Context, role string) string {
