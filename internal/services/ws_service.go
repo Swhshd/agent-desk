@@ -112,6 +112,9 @@ func (s *wsService) upgradeConnection(ctx *gin.Context, principal *dto.AuthPrinc
 		Topics:       make(map[string]struct{}),
 		Send:         make(chan []byte, realtimeSendBufferSize),
 	}
+	if len(customerSessionInfo) > 0 && customerSessionInfo[0] != nil {
+		session.CustomerID = customerSessionInfo[0].CustomerID
+	}
 	session.touch()
 
 	conn.SetReadLimit(realtimeMaxMessageSize)

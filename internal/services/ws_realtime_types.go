@@ -268,6 +268,7 @@ type ClientSession struct {
 	Conn         *websocket.Conn
 	Principal    *dto.AuthPrincipal
 	External     *openidentity.ExternalUser
+	CustomerID   int64
 	Role         string
 	TerminalType string
 	Topics       map[string]struct{}
