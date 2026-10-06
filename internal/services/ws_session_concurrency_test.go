@@ -170,6 +170,172 @@ func TestWsSessionCloseAcrossHandlerRoles(t *testing.T) {
 	}
 }
 
+func TestWsSessionCloseSyntheticRuntime(t *testing.T) {
+	service := newWsService()
+	router := gin.New()
+	router.GET("/target", func(ctx *gin.Context) {
+		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: 101})
+		service.HandleDashboardNotificationWS(ctx)
+	})
+	router.GET("/unaffected", func(ctx *gin.Context) {
+		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: 102})
+		service.HandleDashboardNotificationWS(ctx)
+	})
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	beforeTarget := waitWsGoroutineStacks(t, "synthetic target baseline", func(map[string]string) bool { return true })
+	dial := func(path string) *websocket.Conn {
+		t.Helper()
+		peer, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path, nil)
+		if err != nil {
+			t.Fatalf("synthetic runtime handshake for %s: %v", path, err)
+		}
+		t.Cleanup(func() { _ = peer.Close() })
+		if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if messageType, _, err := peer.ReadMessage(); err != nil || messageType != websocket.TextMessage {
+			t.Fatalf("synthetic runtime connected frame for %s: type=%d error=%v", path, messageType, err)
+		}
+		return peer
+	}
+	targetPeer := dial("/target")
+	targetPumps := make(map[string]string)
+	waitWsGoroutineStacks(t, "synthetic target pump startup", func(stacks map[string]string) bool {
+		clear(targetPumps)
+		counts := make(map[string]int)
+		for id, stack := range stacks {
+			if _, existed := beforeTarget[id]; existed || !strings.Contains(stack, "\ncreated by agent-desk/internal/services.(*wsService).upgradeConnection ") {
+				continue
+			}
+			for _, pump := range []string{"readPump", "writePump"} {
+				if strings.Contains(stack, "\nagent-desk/internal/services.(*wsService)."+pump+"(") {
+					targetPumps[id] = pump
+					counts[pump]++
+				}
+			}
+		}
+		return len(targetPumps) == 2 && counts["readPump"] == 1 && counts["writePump"] == 1
+	})
+	afterTarget := waitWsGoroutineStacks(t, "synthetic unaffected baseline", func(map[string]string) bool { return true })
+	unaffectedPeer := dial("/unaffected")
+	unaffectedPumps := make(map[string]string)
+	waitWsGoroutineStacks(t, "synthetic unaffected pump startup", func(stacks map[string]string) bool {
+		clear(unaffectedPumps)
+		counts := make(map[string]int)
+		for id, stack := range stacks {
+			if _, existed := afterTarget[id]; existed || !strings.Contains(stack, "\ncreated by agent-desk/internal/services.(*wsService).upgradeConnection ") {
+				continue
+			}
+			for _, pump := range []string{"readPump", "writePump"} {
+				if strings.Contains(stack, "\nagent-desk/internal/services.(*wsService)."+pump+"(") {
+					unaffectedPumps[id] = pump
+					counts[pump]++
+				}
+			}
+		}
+		return len(unaffectedPumps) == 2 && counts["readPump"] == 1 && counts["writePump"] == 1
+	})
+
+	targets := service.manager.FindDeliveries([]string{"notification:101"})
+	if len(targets) != 1 || targets[0].Session.Role != realtimeRoleNotification {
+		t.Fatalf("synthetic target registrations = %v, want one notification session", targets)
+	}
+	target := targets[0].Session
+	unaffected := service.manager.FindDeliveries([]string{"notification:102"})
+	if len(unaffected) != 1 || unaffected[0].Session.Role != realtimeRoleNotification {
+		t.Fatalf("synthetic unaffected registrations = %v, want one notification session", unaffected)
+	}
+	t.Cleanup(func() { closeWsSessionWithinDeadline(t, service, unaffected[0].Session) })
+
+	stale := service.manager.FindDeliveries([]string{"notification:101"})
+	if len(stale) != 1 || stale[0].Session != target {
+		t.Fatalf("synthetic stale delivery targets = %v, want target session %p", stale, target)
+	}
+
+	type outcome struct {
+		name       string
+		panicValue any
+	}
+	start := make(chan struct{})
+	outcomes := make(chan outcome, 2)
+	go func() {
+		result := outcome{name: "publish"}
+		defer func() {
+			result.panicValue = recover()
+			outcomes <- result
+		}()
+		<-start
+		service.PublishToTopics(
+			[]string{"notification:101", "notification:102"},
+			RealtimeEvent{EventID: "synthetic-close-race-marker", Type: "synthetic.marker", Topic: "notification:101", At: "synthetic"},
+		)
+	}()
+	go func() {
+		result := outcome{name: "close"}
+		defer func() {
+			result.panicValue = recover()
+			outcomes <- result
+		}()
+		<-start
+		service.closeSession(target)
+	}()
+	close(start)
+
+	for range 2 {
+		select {
+		case result := <-outcomes:
+			if result.panicValue != nil {
+				t.Errorf("synthetic %s panicked during concurrent publish/close: %v", result.name, result.panicValue)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("synthetic concurrent publish/close did not complete within two seconds")
+		}
+	}
+	if target.enqueue([]byte("synthetic stale post-close marker")) {
+		t.Fatal("synthetic stale delivery enqueue after close = true, want false")
+	}
+	service.manager.mu.RLock()
+	_, targetRegistered := service.manager.sessions[target.ID]
+	service.manager.mu.RUnlock()
+	if targetRegistered {
+		t.Fatal("synthetic target remains registered after close")
+	}
+
+	if err := targetPeer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, _, err := targetPeer.ReadMessage(); err == nil {
+			continue // A concurrent publish may enqueue before close linearizes.
+		} else {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				t.Fatalf("synthetic target peer did not observe disconnect within two seconds: %v", err)
+			}
+			break
+		}
+	}
+	waitWsGoroutineStacks(t, "synthetic target pump termination", func(stacks map[string]string) bool {
+		for id := range targetPumps {
+			if _, alive := stacks[id]; alive {
+				return false
+			}
+		}
+		return true
+	})
+	assertWsPeerText(t, unaffectedPeer, []byte(`{"eventId":"synthetic-close-race-marker","type":"synthetic.marker","topic":"notification:101","at":"synthetic"}`))
+	closeWsSessionWithinDeadline(t, service, unaffected[0].Session)
+	waitWsGoroutineStacks(t, "synthetic unaffected pump termination", func(stacks map[string]string) bool {
+		for id := range unaffectedPumps {
+			if _, alive := stacks[id]; alive {
+				return false
+			}
+		}
+		return true
+	})
+}
+
 func newWsPumpTestSocket(t *testing.T) (*wsService, *websocket.Conn, *ClientSession) {
 	t.Helper()
 	service := newWsService()
