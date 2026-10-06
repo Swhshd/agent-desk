@@ -23,9 +23,41 @@ test("customer WebSocket keeps the existing endpoint and does not build a topic"
 })
 
 test("connected topic values are ignored and customer events use payload conversationId", () => {
-  assert.match(supportChatSource, /onMessage:\s*\(messageEvent\)\s*=>\s*\{/)
-  assert.doesNotMatch(supportChatSource, /event\.topic/)
-  assert.match(supportChatSource, /if\s*\(payload\?\.conversationId !== conversationId\)\s*\{\s*return\s*\}/)
-  assert.doesNotMatch(supportChatSource, /connected\.data\.topics/)
+  const handlerStart = supportChatSource.indexOf(
+    "    onMessage: (messageEvent) => {"
+  )
+  const handlerEnd = supportChatSource.indexOf("\n  })", handlerStart)
+  assert.ok(handlerStart >= 0, "support-chat realtime message handler exists")
+  assert.ok(handlerEnd > handlerStart, "support-chat realtime message handler ends")
+
+  const handler = supportChatSource.slice(handlerStart, handlerEnd)
+  assert.match(handler, /const payload = event\.data \?\? event\.payload/)
+  assert.doesNotMatch(
+    handler,
+    /event\.topic|event\.data\.topics|event\.payload\.topics/
+  )
+  assert.doesNotMatch(handler, /\btopics\b/)
+
+  const conversationGuard = handler.indexOf(
+    "if (payload?.conversationId !== conversationId)"
+  )
+  const messageMutation = handler.indexOf(
+    "messages: mergeImMessagesByIdAsc(state.messages, [message])"
+  )
+  const conversationMutation = handler.indexOf(
+    "conversation: patchConversation(state.conversation, payload)"
+  )
+  assert.ok(
+    conversationGuard >= 0,
+    "protected customer updates use payload conversationId"
+  )
+  assert.ok(
+    messageMutation > conversationGuard,
+    "conversation guard precedes message updates"
+  )
+  assert.ok(
+    conversationMutation > conversationGuard,
+    "conversation guard precedes conversation updates"
+  )
   assert.doesNotMatch(supportChatSource, /customer:\$\{|guest:\$\{/)
 })
