@@ -560,14 +560,6 @@ func (s *wsService) PublishToTopics(topics []string, event RealtimeEvent) {
 	}
 }
 
-func (s *wsService) IsGuestOnline(guestID string) bool {
-	guestID = strings.TrimSpace(guestID)
-	if guestID == "" {
-		return false
-	}
-	return s.manager.HasTopic(s.guestTopic(guestID))
-}
-
 func (s *wsService) routeConversationTopics(conversation *models.Conversation) []string {
 	if conversation == nil {
 		return nil
