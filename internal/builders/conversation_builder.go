@@ -44,9 +44,7 @@ func BuildConversationWithLocale(item *models.Conversation, locale string) respo
 		ClosedBy:                  item.ClosedBy,
 		CloseReason:               item.CloseReason,
 	}
-	if identity := services.ConversationService.GetConversationExternalIdentity(item); identity != nil {
-		ret.CustomerOnline = services.WsService.IsGuestOnline(identity.ExternalID)
-	}
+	ret.CustomerOnline = services.WsService.IsCustomerOnline(item.CustomerID)
 	if item.CurrentAssigneeID > 0 {
 		if user := services.UserService.Get(item.CurrentAssigneeID); user != nil {
 			ret.CurrentAssigneeName = user.Nickname

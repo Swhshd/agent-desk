@@ -30,16 +30,20 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			external := welcomeTestExternalUser("synthetic-" + t.Name())
+			external, observerExternal := createCustomerPublicationCollision(t, db, "synthetic-"+t.Name())
 			queue := captureEmployeeRealtimeSession(t, svc, "queue", employeeViewPrincipal(), "admin:all", "admin:101")
 			denied := captureEmployeeRealtimeSession(t, svc, "denied", &dto.AuthPrincipal{UserID: 101}, "admin:all", "admin:101")
 			missing := captureEmployeeRealtimeSession(t, svc, "missing", nil, "admin:all", "admin:101")
-			customer := captureEmployeeRealtimeSession(t, svc, "customer", nil, svc.guestTopic(external.ExternalID))
-			customer.Role = realtimeRoleUser
+			customer := captureCustomerRealtimeSession(t, svc, "customer A", 41, &external)
+			observer := captureCustomerRealtimeSession(t, svc, "customer B", 42, &observerExternal)
 			conv, err := ConversationService.Create(external, 11, ai.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
+			if conv.CustomerID != 41 {
+				t.Fatalf("A conversation owner = %d, want 41", conv.CustomerID)
+			}
+			requireNoCapturedRealtimeEvent(t, observer)
 			if family == "create welcome" {
 				for _, kind := range []string{enums.IMRealtimeEventConversationCreated, enums.IMRealtimeEventMessageCreated, enums.IMRealtimeEventConversationUpdated} {
 					q := requireCapturedRealtimeEvent(t, queue, kind)
@@ -66,6 +70,11 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 			// Creation is synchronous; drain it before capturing the family under test.
 			drainEmployeePublication(queue, denied, missing, customer)
 			full := captureEmployeeRealtimeSession(t, svc, "full", employeeViewPrincipal(), svc.conversationTopic(conv.ID))
+			// Admission proves ownership; later empty-queue checks prove one frame
+			// per publication even though A belongs to both delivery destinations.
+			if got := svc.subscribeTopics(customer, []string{svc.conversationTopic(conv.ID)}); !reflect.DeepEqual(got, []string{svc.conversationTopic(conv.ID)}) {
+				t.Fatalf("customer owner conversation subscription = %v", got)
+			}
 			svc.manager.Subscribe(denied, []string{svc.conversationTopic(conv.ID)})
 			svc.manager.Subscribe(missing, []string{svc.conversationTopic(conv.ID)})
 			createEmployeePublicationAgent(t, db, 101, 1)
@@ -205,6 +214,7 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 				}
 				f := requireCapturedRealtimeEvent(t, full, q.Type)
 				c := requireCapturedRealtimeEvent(t, customer, q.Type)
+				requireNoCapturedRealtimeEvent(t, observer)
 				if !reflect.DeepEqual(f, c) {
 					t.Fatalf("customer original differs from full employee: full=%+v customer=%+v", f, c)
 				}
@@ -263,8 +273,26 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 			}
 			requireNoCapturedRealtimeEvent(t, full)
 			requireNoCapturedRealtimeEvent(t, customer)
+			requireNoCapturedRealtimeEvent(t, observer)
 			requireNoCapturedRealtimeEvent(t, denied)
 			requireNoCapturedRealtimeEvent(t, missing)
+			if family == "customer assigned" {
+				observerConversation := &models.Conversation{CustomerID: 42, ChannelID: 11, AIAgentID: ai.ID, Status: enums.IMConversationStatusActive, CurrentAssigneeID: 101}
+				if err := db.Create(observerConversation).Error; err != nil {
+					t.Fatal(err)
+				}
+				if _, err := MessageService.SendCustomerMessageWithRequestID(observerConversation.ID, "synthetic-B-owned-message", enums.IMMessageTypeText, "synthetic-owner-B-marker", "", observerExternal, "synthetic-B-request"); err != nil {
+					t.Fatal(err)
+				}
+				message := requireCapturedRealtimeEvent(t, observer, enums.IMRealtimeEventMessageCreated)
+				if message.Data["content"] != "synthetic-owner-B-marker" || message.Data["conversationId"] != float64(observerConversation.ID) {
+					t.Fatal("B-owned message marker or conversation lost")
+				}
+				requireCapturedRealtimeEvent(t, observer, enums.IMRealtimeEventConversationUpdated)
+				requireNoCapturedRealtimeEvent(t, observer)
+				requireNoCapturedRealtimeEvent(t, customer)
+				requireNoCapturedRealtimeEvent(t, full)
+			}
 		})
 	}
 }

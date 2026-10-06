@@ -30,7 +30,8 @@ func TestDashboardRealtimeDefaultTopics(t *testing.T) {
 		{"admin with view", &ClientSession{Role: realtimeRoleAdmin, Principal: &dto.AuthPrincipal{UserID: 101, Permissions: []string{constants.PermissionConversationView.Code}}}, []string{"admin:101", "admin:all"}},
 		{"notification", &ClientSession{Role: realtimeRoleNotification, Principal: &dto.AuthPrincipal{UserID: 101}}, []string{"notification:101"}},
 		{"user", &ClientSession{Role: realtimeRoleUser, Principal: &dto.AuthPrincipal{UserID: 101}}, []string{"user:101"}},
-		{"guest", &ClientSession{Role: realtimeRoleUser, External: &openidentity.ExternalUser{ExternalID: "guest-101"}}, []string{"guest:guest-101"}},
+		{"guest", &ClientSession{Role: realtimeRoleUser, CustomerID: 101, External: &openidentity.ExternalUser{ExternalID: "guest-101"}}, []string{"customer:101"}},
+		{"external missing customer", &ClientSession{Role: realtimeRoleUser, External: &openidentity.ExternalUser{ExternalID: "guest-101"}}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := svc.defaultTopics(tc.session); !slices.Equal(got, tc.want) {

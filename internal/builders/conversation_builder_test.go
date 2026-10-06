@@ -1,14 +1,129 @@
 package builders
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"agent-desk/internal/models"
+	"agent-desk/internal/pkg/config"
 	"agent-desk/internal/pkg/enums"
 	"agent-desk/internal/pkg/i18nx"
+	"agent-desk/internal/pkg/openidentity"
+	"agent-desk/internal/services"
+
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/gorilla/websocket"
+	"github.com/mlogclub/simple/sqls"
+	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
+
+// Presence via the shared external ID must fail the A-online/B-offline result.
+func TestConversationBuilderCustomerOnlineUsesConversationCustomerID(t *testing.T) {
+	previousDB, previousConfig := sqls.DB(), config.GetCurrent()
+	t.Cleanup(func() {
+		sqls.SetDB(previousDB)
+		config.SetCurrent(previousConfig)
+	})
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "t_", SingularTable: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := db.AutoMigrate(&models.Channel{}, &models.Customer{}, &models.CustomerIdentity{}, &models.Conversation{}, &models.ConversationReadState{}); err != nil {
+		t.Fatal(err)
+	}
+	sqls.SetDB(db)
+	signingKey := make([]byte, 32)
+	if _, err := rand.Read(signingKey); err != nil {
+		t.Fatal("generate in-memory signing key")
+	}
+	config.SetCurrent(&config.Config{CustomerSession: config.CustomerSessionConfig{Secret: base64.RawURLEncoding.EncodeToString(signingKey)}})
+	channel := &models.Channel{ID: 701, ChannelID: "synthetic-builder-channel", Status: enums.StatusOk}
+	customerA := &models.Customer{ID: 741, Name: "synthetic-builder-A", Status: enums.StatusOk}
+	customerB := &models.Customer{ID: 742, Name: "synthetic-builder-B", Status: enums.StatusOk}
+	externalID := "synthetic-builder-collision"
+	externalA := openidentity.ExternalUser{ExternalSource: enums.ExternalSourceGuest, ExternalID: externalID}
+	conversationA := &models.Conversation{ID: 751, CustomerID: customerA.ID, ChannelID: channel.ID}
+	conversationB := &models.Conversation{ID: 752, CustomerID: customerB.ID, ChannelID: channel.ID}
+	for _, row := range []any{
+		channel, customerA, customerB, conversationA, conversationB,
+		&models.CustomerIdentity{CustomerID: customerA.ID, ExternalSource: enums.ExternalSourceGuest, ExternalID: externalID, Status: enums.StatusOk},
+		&models.CustomerIdentity{CustomerID: customerB.ID, ExternalSource: enums.ExternalSourceUser, ExternalID: externalID, Status: enums.StatusOk},
+	} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	token, _, err := services.CustomerSessionService.Sign(channel, customerA, externalA)
+	if err != nil {
+		t.Fatal("sign synthetic builder session")
+	}
+	router := gin.New()
+	router.GET("/api/ws/open", services.WsService.HandleOpenWS)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	headers := http.Header{"Authorization": {"Bearer " + token}, "X-Channel-ID": {channel.ChannelID}}
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/api/ws/open", headers)
+	if err != nil {
+		t.Fatal("synthetic builder WebSocket handshake failed")
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if !services.WsService.IsCustomerOnline(customerA.ID) {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Error("synthetic builder socket remained online after cleanup")
+	})
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var connected struct {
+		Type string `json:"type"`
+		Data struct {
+			Topics []string `json:"topics"`
+		} `json:"data"`
+	}
+	if err := conn.ReadJSON(&connected); err != nil {
+		t.Fatal("read synthetic builder connected frame")
+	}
+	if connected.Type != enums.IMRealtimeEventConnected || len(connected.Data.Topics) != 1 || connected.Data.Topics[0] != "customer:741" {
+		t.Fatal("builder fixture did not authenticate Customer A on only its customer topic")
+	}
+	var identityOrChannelQueries atomic.Int64
+	if err := db.Callback().Query().Before("gorm:query").Register("test:builder_presence_lookup", func(tx *gorm.DB) {
+		if tx.Statement.Table == "t_customer_identity" || tx.Statement.Table == "t_channel" {
+			identityOrChannelQueries.Add(1)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !BuildConversationWithLocale(conversationA, i18nx.DefaultLocale).CustomerOnline {
+		t.Error("A conversation must report its authenticated customer online")
+	}
+	if BuildConversationWithLocale(conversationB, i18nx.DefaultLocale).CustomerOnline {
+		t.Error("B conversation must remain offline despite A's matching external ID")
+	}
+	if got := identityOrChannelQueries.Load(); got != 0 {
+		t.Errorf("builder presence queried customer identities/channels %d times", got)
+	}
+}
 
 func TestLocalizeConversationSummary(t *testing.T) {
 	t.Parallel()

@@ -46,6 +46,7 @@ type customerSessionClaims struct {
 }
 
 type CustomerSessionVerifyResult struct {
+	CustomerID   int64
 	ExternalUser *openidentity.ExternalUser
 	Token        string
 	ExpiresAt    time.Time
@@ -140,6 +141,7 @@ func (s *customerSessionService) VerifyRequest(ctx *gin.Context, channel *models
 		return nil, err
 	}
 	result := &CustomerSessionVerifyResult{
+		CustomerID:   claims.CustomerID,
 		ExternalUser: external,
 		Token:        token,
 		ExpiresAt:    claims.ExpiresAt.Time,
