@@ -207,6 +207,57 @@ func TestWsSessionEnqueueAfterClose(t *testing.T) {
 	assertWsSessionSendClosed(t, session)
 }
 
+func TestWsSessionCloseRejectsStaleOperations(t *testing.T) {
+	service, session, topic := newWsSessionConcurrencyFixture("stale-operations")
+	staleTargets := service.manager.FindDeliveries([]string{topic})
+	if len(staleTargets) != 1 || staleTargets[0].Session != session {
+		t.Fatalf("captured delivery targets = %v, want session %p", staleTargets, session)
+	}
+
+	service.closeSession(session)
+	if staleTargets[0].Session.enqueue([]byte("stale delivery")) {
+		t.Fatal("enqueue through stale delivery target after close = true, want false")
+	}
+
+	lateTopic := "user:late-subscribe"
+	got := service.manager.Subscribe(session, []string{lateTopic})
+	if _, exists := session.Topics[lateTopic]; exists {
+		t.Fatal("late Subscribe added topic to session")
+	}
+	if service.manager.HasTopic(lateTopic) {
+		t.Fatal("late Subscribe added session to topic registry")
+	}
+	service.manager.mu.RLock()
+	_, registered := service.manager.sessions[session.ID]
+	service.manager.mu.RUnlock()
+	if registered {
+		t.Fatal("late Subscribe re-registered managed session")
+	}
+	if len(got) != 0 {
+		t.Fatalf("late Subscribe acknowledgments = %v, want none", got)
+	}
+}
+
+func TestWsSessionSubscribeBeforeCloseIsUnregistered(t *testing.T) {
+	service := newWsService()
+	session := &ClientSession{
+		ID:     "subscribe-before-close",
+		Topics: make(map[string]struct{}),
+		Send:   make(chan []byte, realtimeSendBufferSize),
+	}
+	service.manager.Register(session, nil)
+	topic := "user:before-close"
+	if got := service.manager.Subscribe(session, []string{topic}); len(got) != 1 || got[0] != topic {
+		t.Fatalf("Subscribe acknowledgments = %v, want [%s]", got, topic)
+	}
+
+	service.closeSession(session)
+	assertWsSessionCleanup(t, service, session, topic)
+	if _, exists := session.Topics[topic]; exists {
+		t.Fatal("session topic remains after close")
+	}
+}
+
 func newWsSessionConcurrencyFixture(id string) (*wsService, *ClientSession, string) {
 	service := newWsService()
 	session := &ClientSession{

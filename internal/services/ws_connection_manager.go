@@ -57,6 +57,9 @@ func (m *WsConnectionManager) Subscribe(session *ClientSession, topics []string)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if session.Closed.Load() {
+		return nil
+	}
 
 	ret := make([]string, 0, len(topics))
 	for _, topic := range topics {
