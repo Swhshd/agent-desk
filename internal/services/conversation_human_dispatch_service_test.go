@@ -106,11 +106,20 @@ func TestConversationHumanDispatchHumanOnlyCreateOffHoursUsesGlobalPendingPool(t
 	db := setupConversationHumanDispatchTestDB(t)
 	aiAgent := createHumanDispatchAIAgent(t, db, enums.IMConversationServiceModeHumanOnly, "1")
 
-	conversation, err := services.ConversationService.Create(openidentity.ExternalUser{
+	external := openidentity.ExternalUser{
 		ExternalSource: enums.ExternalSourceGuest,
 		ExternalID:     "guest-human-only-off-hours",
 		ExternalName:   "非服务时间访客",
-	}, 1, aiAgent.ID)
+	}
+	var customerID int64
+	if err := sqls.WithTransaction(func(ctx *sqls.TxContext) error {
+		var err error
+		customerID, err = services.CustomerService.CreateFreshGuestCustomer(ctx, external)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := services.ConversationService.CreateForCustomer(customerID, external, 1, aiAgent.ID)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
@@ -134,11 +143,20 @@ func TestConversationHumanDispatchHumanOnlyCreateAssignsAvailableAgent(t *testin
 	createHumanDispatchActiveSchedule(t, db, 1)
 	createHumanDispatchAgentProfile(t, db, 101, 1, enums.ServiceStatusIdle, 3, true, enums.StatusOk)
 
-	conversation, err := services.ConversationService.Create(openidentity.ExternalUser{
+	external := openidentity.ExternalUser{
 		ExternalSource: enums.ExternalSourceGuest,
 		ExternalID:     "guest-human-only-assigned",
 		ExternalName:   "服务时间访客",
-	}, 1, aiAgent.ID)
+	}
+	var customerID int64
+	if err := sqls.WithTransaction(func(ctx *sqls.TxContext) error {
+		var err error
+		customerID, err = services.CustomerService.CreateFreshGuestCustomer(ctx, external)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := services.ConversationService.CreateForCustomer(customerID, external, 1, aiAgent.ID)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}

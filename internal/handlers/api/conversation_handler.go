@@ -23,7 +23,8 @@ func ConversationGetBy(ctx *gin.Context) {
 		return
 	}
 	external := httpx.GetExternalUser(ctx)
-	if external == nil {
+	customerID := httpx.GetVerifiedCustomerID(ctx)
+	if external == nil || customerID <= 0 {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0150"))
 		return
 	}
@@ -33,7 +34,7 @@ func ConversationGetBy(ctx *gin.Context) {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0116"))
 		return
 	}
-	if !services.ConversationService.IsCustomerConversationOwner(item, *external) {
+	if !services.ConversationService.IsVerifiedCustomerConversationOwner(item, customerID) {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0222"))
 		return
 	}
@@ -52,12 +53,13 @@ func ConversationPostCreate_or_match(ctx *gin.Context) {
 		return
 	}
 	external := httpx.GetExternalUser(ctx)
-	if external == nil {
+	customerID := httpx.GetVerifiedCustomerID(ctx)
+	if external == nil || customerID <= 0 {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0150"))
 		return
 	}
 
-	item, err := services.ConversationService.Create(*external, channel.ID, channel.AIAgentID)
+	item, err := services.ConversationService.CreateForCustomer(customerID, *external, channel.ID, channel.AIAgentID)
 	if err != nil {
 		httpx.WriteJSON(ctx, err)
 		return
@@ -71,7 +73,8 @@ func ConversationPostClose(ctx *gin.Context) {
 		return
 	}
 	external := httpx.GetExternalUser(ctx)
-	if external == nil {
+	customerID := httpx.GetVerifiedCustomerID(ctx)
+	if external == nil || customerID <= 0 {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0150"))
 		return
 	}
@@ -81,7 +84,7 @@ func ConversationPostClose(ctx *gin.Context) {
 		httpx.WriteJSON(ctx, err)
 		return
 	}
-	if err := services.ConversationService.CloseCustomerConversation(req.ConversationID, *external); err != nil {
+	if err := services.ConversationService.CloseVerifiedCustomerConversation(req.ConversationID, customerID); err != nil {
 		httpx.WriteJSON(ctx, err)
 		return
 	}

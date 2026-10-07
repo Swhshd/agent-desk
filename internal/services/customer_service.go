@@ -115,61 +115,9 @@ func (s *customerService) CountByCompanyIDs(companyIDs []int64) map[int64]int64 
 	return repositories.CustomerRepository.CountByCompanyIDs(sqls.DB(), companyIDs, int(enums.StatusDeleted))
 }
 
+// EnsureExternalCustomer preserves the legacy non-guest adapter entry point.
 func (s *customerService) EnsureExternalCustomer(ctx *sqls.TxContext, externalUser openidentity.ExternalUser) (int64, error) {
-	if ctx == nil || ctx.Tx == nil {
-		return 0, errorsx.InvalidParamI18n("error.e0086")
-	}
-	externalSource := externalUser.ExternalSource
-	externalID := strings.TrimSpace(externalUser.ExternalID)
-	if strings.TrimSpace(string(externalSource)) == "" || externalID == "" {
-		return 0, errorsx.UnauthorizedI18n("error.e0149")
-	}
-	now := time.Now()
-	if identity := repositories.CustomerIdentityRepository.GetBy(ctx.Tx, externalSource, externalID); identity != nil {
-		updates := map[string]any{
-			"last_active_at": now,
-			"updated_at":     now,
-		}
-		if strs.IsNotBlank(externalUser.ExternalName) {
-			updates["name"] = externalUser.ExternalName
-		}
-		if err := repositories.CustomerRepository.Updates(ctx.Tx, identity.CustomerID, updates); err != nil {
-			return 0, err
-		}
-
-		ctx.RegisterCallback(func() {
-			if strs.IsNotBlank(externalUser.ExternalName) {
-				if err := s.syncConversationCustomerName(sqls.DB(), identity.CustomerID, externalUser.ExternalName, nil, now); err != nil {
-					slog.Error("sync conversation customer name failed",
-						"customerId", identity.CustomerID,
-						"customerName", externalUser.ExternalName,
-						"error", err,
-					)
-				}
-			}
-		})
-		return identity.CustomerID, nil
-	}
-
-	customer := &models.Customer{
-		Name:         buildExternalCustomerName(externalUser),
-		LastActiveAt: &now,
-		Status:       enums.StatusOk,
-		AuditFields:  utils.BuildAuditFields(nil),
-	}
-	if err := repositories.CustomerRepository.Create(ctx.Tx, customer); err != nil {
-		return 0, err
-	}
-	if err := repositories.CustomerIdentityRepository.Create(ctx.Tx, &models.CustomerIdentity{
-		CustomerID:     customer.ID,
-		ExternalSource: externalSource,
-		ExternalID:     externalID,
-		Status:         enums.StatusOk,
-		AuditFields:    utils.BuildAuditFields(nil),
-	}); err != nil {
-		return 0, err
-	}
-	return customer.ID, nil
+	return s.EnsureVerifiedExternalCustomer(ctx, externalUser)
 }
 
 // CreateFreshGuestCustomer creates a new customer using only the supplied hint.

@@ -36,7 +36,7 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 			missing := captureEmployeeRealtimeSession(t, svc, "missing", nil, "admin:all", "admin:101")
 			customer := captureCustomerRealtimeSession(t, svc, "customer A", 41, &external)
 			observer := captureCustomerRealtimeSession(t, svc, "customer B", 42, &observerExternal)
-			conv, err := ConversationService.Create(external, 11, ai.ID)
+			conv, err := ConversationService.CreateForCustomer(41, external, 11, ai.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
