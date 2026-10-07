@@ -36,6 +36,7 @@ class MonitorSocket {
   constructor() { MonitorSocket.instances.push(this) }
   close() { this.readyState = MonitorSocket.CLOSED }
   send(value) { this.sent.push(value) }
+  emit(type, event = {}) { this[`on${type}`]?.(event) }
   fail() { this.onclose?.({ code: 1006 }) }
 }
 MonitorSocket.instances = []
@@ -77,7 +78,14 @@ function setup(validator) {
     MonitorSocket, globalThis.window, 2000, 30000,
   )
   const cleanup = makeEffect()
-  return { timers, cleanup, get validations() { return validations }, sockets: MonitorSocket.instances }
+  const fireRetry = async () => {
+    const entry = timers.entries().next().value
+    assert.ok(entry, "a Monitor retry timer is pending")
+    timers.delete(entry[0])
+    entry[1].callback()
+    await flushPromises()
+  }
+  return { timers, cleanup, fireRetry, get validations() { return validations }, sockets: MonitorSocket.instances }
 }
 
 test("invalid profile stops Monitor reconnect and cancels retry", async () => {
@@ -105,6 +113,34 @@ test("transient Monitor validation preserves retry schedule", async () => {
   env.cleanup()
 })
 
+test("valid Monitor profile schedules and starts the next socket", async () => {
+  const env = setup(async () => "valid")
+  env.sockets[0].fail()
+  await flushPromises()
+  assert.equal(env.timers.size, 1)
+  assert.equal([...env.timers.values()][0].delay, 2000)
+  await env.fireRetry()
+  assert.equal(env.sockets.length, 2)
+  env.cleanup()
+})
+
+test("Monitor error and repeated close signals share one pending validation cycle", async () => {
+  let resolve
+  const pending = new Promise((done) => { resolve = done })
+  const env = setup(() => pending)
+  env.sockets[0].emit("error", { error: "synthetic" })
+  env.sockets[0].fail()
+  env.sockets[0].fail()
+  await flushPromises()
+  assert.equal(env.validations, 1)
+  assert.equal(env.timers.size, 0)
+  resolve("valid")
+  await flushPromises()
+  assert.equal(env.timers.size, 1)
+  assert.equal(env.validations, 1)
+  env.cleanup()
+})
+
 test("Monitor unmount cancels unresolved validation and pending timer", async () => {
   let resolve
   const pending = new Promise((done) => { resolve = done })
@@ -113,6 +149,16 @@ test("Monitor unmount cancels unresolved validation and pending timer", async ()
   env.cleanup()
   resolve("valid")
   await flushPromises()
+  assert.equal(env.timers.size, 0)
+  assert.equal(env.sockets.length, 1)
+})
+
+test("Monitor unmount cancels an already-pending retry timer", async () => {
+  const env = setup(async () => "valid")
+  env.sockets[0].fail()
+  await flushPromises()
+  assert.equal(env.timers.size, 1)
+  env.cleanup()
   assert.equal(env.timers.size, 0)
   assert.equal(env.sockets.length, 1)
 })
