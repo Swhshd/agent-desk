@@ -19,7 +19,7 @@ func CustomerPostSession_exchange(ctx *gin.Context) {
 		httpx.WriteJSON(ctx, err)
 		return
 	}
-	resp, err := services.CustomerSessionService.Exchange(channel, *externalUser)
+	resp, err := services.CustomerSessionService.Exchange(channel, *externalUser, ctx.GetHeader("X-Customer-Session-Token"))
 	if err != nil {
 		httpx.WriteJSON(ctx, err)
 		return
