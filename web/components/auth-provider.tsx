@@ -12,11 +12,13 @@ import { usePathname, useRouter } from "next/navigation"
 
 import { SessionProvider, useSession } from "@/components/session-provider"
 import { type AuthSession } from "@/lib/auth"
+import type { RealtimeProfileResult } from "@/lib/realtime-connection"
 
 type AuthContextValue = {
   session: AuthSession | null
   ready: boolean
   refreshProfile: () => Promise<void>
+  validateRealtimeProfile: () => Promise<RealtimeProfileResult>
   signOut: () => Promise<void>
 }
 
@@ -33,7 +35,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 function DashboardAuthProvider({ children }: { children: ReactNode }) {
   const pathname = usePathname()
   const router = useRouter()
-  const { session, ready, refreshSession, signOut: endSession } = useSession()
+  const { session, ready, refreshSession, validateRealtimeProfile, signOut: endSession } = useSession()
   const isDashboardLoginRoute = pathname?.startsWith("/dashboard/login") ?? false
   const requiresAuth =
     ((pathname?.startsWith("/dashboard") ?? false) ||
@@ -61,7 +63,7 @@ function DashboardAuthProvider({ children }: { children: ReactNode }) {
   }, [ready, requiresAuth, router, session])
 
   return (
-    <AuthContext.Provider value={{ session, ready, refreshProfile, signOut }}>
+    <AuthContext.Provider value={{ session, ready, refreshProfile, validateRealtimeProfile, signOut }}>
       {children}
     </AuthContext.Provider>
   )

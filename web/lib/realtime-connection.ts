@@ -1,10 +1,12 @@
 "use client"
 
 export type RealtimeConnectionStatus = "connecting" | "connected" | "disconnected"
+export type RealtimeProfileResult = "valid" | "invalid" | "transient"
 
 type RealtimeConnectionManagerOptions = {
   createSocket: () => WebSocket
   canReconnect?: () => boolean
+  beforeReconnect?: () => Promise<RealtimeProfileResult>
   onStatusChange?: (status: RealtimeConnectionStatus) => void
   onSocketChange?: (socket: WebSocket | null) => void
   onOpen?: (socket: WebSocket) => void
@@ -35,6 +37,9 @@ export function createRealtimeConnectionManager(
   let pingTimer: number | null = null
   let reconnectAttempt = 0
   let reconnectEnabled = false
+  let validationGeneration = 0
+  let validationTicket: object | null = null
+  let failedSocket: WebSocket | null = null
 
   const clearReconnectTimer = () => {
     if (reconnectTimer !== null) {
@@ -84,6 +89,53 @@ export function createRealtimeConnectionManager(
     }, delay)
   }
 
+  const validateAndScheduleReconnect = () => {
+    if (!canReconnect()) {
+      return
+    }
+    if (!options.beforeReconnect) {
+      scheduleReconnect()
+      return
+    }
+    if (validationTicket) {
+      return
+    }
+
+    const ticket = {}
+    const generation = validationGeneration
+    validationTicket = ticket
+    void Promise.resolve()
+      .then(() => options.beforeReconnect?.() ?? "transient")
+      .then((result) => {
+        if (validationTicket !== ticket || generation !== validationGeneration) {
+          return
+        }
+        validationTicket = null
+        if (result === "invalid") {
+          reconnectEnabled = false
+          clearReconnectTimer()
+          const currentSocket = socket
+          if (
+            currentSocket &&
+            (currentSocket.readyState === WebSocket.OPEN ||
+              currentSocket.readyState === WebSocket.CONNECTING)
+          ) {
+            currentSocket.close()
+          }
+          options.onStatusChange?.("disconnected")
+          return
+        }
+        scheduleReconnect()
+      })
+      .catch(() => {
+        if (validationTicket !== ticket || generation !== validationGeneration) {
+          return
+        }
+        validationTicket = null
+        scheduleReconnect()
+      })
+  }
+
   const connect = () => {
     reconnectEnabled = true
     if (!(options.canReconnect?.() ?? true)) {
@@ -92,6 +144,7 @@ export function createRealtimeConnectionManager(
 
     disconnect({ reconnect: true, updateStatus: false })
     reconnectEnabled = true
+    failedSocket = null
     options.onStatusChange?.("connecting")
 
     let nextSocket: WebSocket
@@ -100,7 +153,7 @@ export function createRealtimeConnectionManager(
     } catch (error) {
       options.onStatusChange?.("disconnected")
       options.onConnectError?.(error)
-      scheduleReconnect()
+      validateAndScheduleReconnect()
       return
     }
 
@@ -141,7 +194,10 @@ export function createRealtimeConnectionManager(
         return
       }
       if (canReconnect()) {
-        scheduleReconnect()
+        if (failedSocket !== nextSocket) {
+          failedSocket = nextSocket
+          validateAndScheduleReconnect()
+        }
       } else {
         options.onStatusChange?.("disconnected")
       }
@@ -153,11 +209,16 @@ export function createRealtimeConnectionManager(
       }
       options.onError?.(event, nextSocket)
       options.onStatusChange?.("disconnected")
-      scheduleReconnect()
+      if (failedSocket !== nextSocket) {
+        failedSocket = nextSocket
+        validateAndScheduleReconnect()
+      }
     })
   }
 
   const disconnect = (disconnectOptions?: DisconnectOptions) => {
+    validationGeneration += 1
+    validationTicket = null
     reconnectEnabled = disconnectOptions?.reconnect ?? false
     clearTimers()
     if (!reconnectEnabled) {

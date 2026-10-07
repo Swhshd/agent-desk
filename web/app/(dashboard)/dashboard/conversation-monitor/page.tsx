@@ -12,6 +12,7 @@ import { toast } from "sonner"
 
 import { ConversationCloseDialog } from "@/components/conversation-actions/close-dialog"
 import { ConversationTransferDialog } from "@/components/conversation-actions/transfer-dialog"
+import { useAuth } from "@/components/auth-provider"
 import {
   DashboardPage,
   DashboardTableShell,
@@ -115,6 +116,7 @@ function getStatusOptions(
 
 export default function DashboardConversationsPage() {
   const t = useI18n()
+  const { validateRealtimeProfile } = useAuth()
   const statusOptions = useMemo(() => getStatusOptions(t), [t])
   const [keywordInput, setKeywordInput] = useState("")
   const [statusFilterInput, setStatusFilterInput] = useState("all")
@@ -234,6 +236,9 @@ export default function DashboardConversationsPage() {
 
   useEffect(() => {
     let cancelled = false
+    let stopped = false
+    let validationInFlight = false
+    let validationGeneration = 0
 
     const clearTimers = () => {
       if (reconnectTimerRef.current) {
@@ -247,22 +252,38 @@ export default function DashboardConversationsPage() {
     }
 
     const scheduleReconnect = () => {
-      if (cancelled || reconnectTimerRef.current) {
+      if (cancelled || stopped || reconnectTimerRef.current || validationInFlight) {
         return
       }
-      const delay = Math.min(
-        RECONNECT_BASE_DELAY * 2 ** reconnectAttemptRef.current,
-        RECONNECT_MAX_DELAY
-      )
-      reconnectTimerRef.current = window.setTimeout(() => {
-        reconnectTimerRef.current = null
-        reconnectAttemptRef.current += 1
-        connect()
-      }, delay)
+      validationInFlight = true
+      const generation = ++validationGeneration
+      void validateRealtimeProfile().catch(() => "transient" as const).then((result) => {
+        if (cancelled || generation !== validationGeneration) {
+          return
+        }
+        validationInFlight = false
+        if (result === "invalid") {
+          stopped = true
+          clearTimers()
+          const socket = websocketRef.current
+          websocketRef.current = null
+          socket?.close()
+          return
+        }
+        const delay = Math.min(
+          RECONNECT_BASE_DELAY * 2 ** reconnectAttemptRef.current,
+          RECONNECT_MAX_DELAY
+        )
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null
+          reconnectAttemptRef.current += 1
+          connect()
+        }, delay)
+      })
     }
 
     const connect = () => {
-      if (cancelled) {
+      if (cancelled || stopped) {
         return
       }
 
@@ -353,6 +374,8 @@ export default function DashboardConversationsPage() {
 
     return () => {
       cancelled = true
+      validationGeneration += 1
+      validationInFlight = false
       clearTimers()
       reconnectAttemptRef.current = 0
       const socket = websocketRef.current
@@ -362,7 +385,7 @@ export default function DashboardConversationsPage() {
       }
       subscribedConversationIdRef.current = null
     }
-  }, [loadConversations, t])
+  }, [loadConversations, t, validateRealtimeProfile])
 
   useEffect(() => {
     const socket = websocketRef.current
