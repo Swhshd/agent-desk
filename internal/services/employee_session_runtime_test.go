@@ -3,16 +3,20 @@ package services
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"agent-desk/internal/models"
+	"agent-desk/internal/pkg/config"
+	"agent-desk/internal/pkg/constants"
 	"agent-desk/internal/pkg/dto"
 	"agent-desk/internal/pkg/enums"
 	"agent-desk/internal/pkg/openidentity"
@@ -34,7 +38,14 @@ func TestEmployeeSessionRuntimeAcceptance(t *testing.T) {
 		return
 	}
 
-	for _, scenario := range []string{"exact_session_revoke", "revoke_all", "password_change", "disable_before_revoke_failure", "assign_roles_commit_and_rollback", "role_status_current_members", "committed_impact_failure_customer_isolation", "idle_login_session_expiry", "idle_direct_allow_expiry", "idle_direct_deny_expiry"} {
+	for _, scenario := range []string{
+		"exact_session_revoke", "revoke_all", "password_change", "disable_before_revoke_failure",
+		"assign_roles_commit_and_rollback", "role_status_current_members", "role_permission_replacement",
+		"builtin_permission_sync", "oidc_default_role_grant", "direct_user_permission_crud",
+		"committed_impact_failure_customer_isolation", "pending_revoke_before_registration",
+		"pending_revoke_after_registration", "timer_publication_and_callback_revoke",
+		"idle_login_session_expiry", "idle_direct_allow_expiry", "idle_direct_deny_expiry",
+	} {
 		t.Run(scenario, func(t *testing.T) {
 			binary, err := os.Executable()
 			if err != nil {
@@ -142,6 +153,10 @@ func runEmployeeSessionRuntimeScenario(t *testing.T, scenario string) {
 		if err := service.AssignRoles(alpha.user.ID, []int64{role.ID}, &dto.AuthPrincipal{UserID: beta.user.ID, Username: beta.user.Username}); err != nil {
 			t.Fatal("commit role assignment")
 		}
+		var committedRoles []models.UserRole
+		if err := db.Where("user_id = ?", alpha.user.ID).Order("role_id").Find(&committedRoles).Error; err != nil {
+			t.Fatal("read committed synthetic role membership")
+		}
 		assertRuntimeSocketClosed(t, alphaA)
 		assertRuntimeSocketClosed(t, alphaB)
 		assertRuntimePingPong(t, betaA)
@@ -153,7 +168,164 @@ func runEmployeeSessionRuntimeScenario(t *testing.T, scenario string) {
 		if err := service.AssignRoles(alpha.user.ID, []int64{int64(1 << 60)}, &dto.AuthPrincipal{UserID: beta.user.ID, Username: beta.user.Username}); err == nil {
 			t.Fatal("invalid role assignment unexpectedly committed")
 		}
+		var afterRollback []models.UserRole
+		if err := db.Where("user_id = ?", alpha.user.ID).Order("role_id").Find(&afterRollback).Error; err != nil {
+			t.Fatal("read role membership after rollback")
+		}
+		if !slices.EqualFunc(committedRoles, afterRollback, func(a, b models.UserRole) bool { return a.UserID == b.UserID && a.RoleID == b.RoleID }) {
+			t.Fatal("failed role replacement changed persisted UserRole membership")
+		}
 		assertRuntimePingPong(t, alphaC)
+	case "role_permission_replacement":
+		oldPermission := models.Permission{Code: "runtime.old.permission", Name: "Old permission", Status: enums.StatusOk}
+		newPermission := models.Permission{Code: "runtime.new.permission", Name: "New permission", Status: enums.StatusOk}
+		role := models.Role{Code: "runtime-replacement-role", Name: "Replacement role", Status: enums.StatusOk}
+		for _, record := range []any{&oldPermission, &newPermission, &role} {
+			if err := db.Create(record).Error; err != nil {
+				t.Fatal("create replacement fixture")
+			}
+		}
+		if err := db.Create(&models.RolePermission{RoleID: role.ID, PermissionID: oldPermission.ID}).Error; err != nil {
+			t.Fatal("seed old role permission")
+		}
+		if err := db.Create(&models.UserRole{UserID: alpha.user.ID, RoleID: role.ID}).Error; err != nil {
+			t.Fatal("seed alpha role membership")
+		}
+		if err := newRoleService(lifecycle).AssignPermissions(role.ID, []int64{newPermission.ID}, &dto.AuthPrincipal{UserID: beta.user.ID, Username: beta.user.Username}); err != nil {
+			t.Fatal("replace role permissions")
+		}
+		assertRuntimeSocketClosed(t, alphaA)
+		assertRuntimeSocketClosed(t, alphaB)
+		assertRuntimePingPong(t, betaA)
+		snapshot, err := (employeeAuthStateReader{}).ReadEmployeeSession(alpha.login.ID, time.Now())
+		if err != nil || slices.Contains(snapshot.Principal.Permissions, oldPermission.Code) || !slices.Contains(snapshot.Principal.Permissions, newPermission.Code) {
+			t.Fatal("fresh alpha permission snapshot does not reflect replacement")
+		}
+	case "builtin_permission_sync":
+		roleCode := ""
+		var target constants.Permission
+		for _, permission := range constants.Permissions {
+			for code, permissions := range constants.RolePermissions {
+				for _, candidate := range permissions {
+					if candidate.Code == permission.Code {
+						roleCode, target = code, permission
+						break
+					}
+				}
+				if roleCode != "" {
+					break
+				}
+			}
+			if roleCode != "" {
+				break
+			}
+		}
+		if roleCode == "" {
+			t.Fatal("no built-in role permission fixture available")
+		}
+		roles := map[string]*models.Role{}
+		for _, roleSpec := range constants.Roles {
+			role := &models.Role{Code: roleSpec.Code, Name: roleSpec.Name, Status: enums.StatusOk, IsSystem: true}
+			if err := db.Create(role).Error; err != nil {
+				t.Fatal("create built-in role")
+			}
+			roles[role.Code] = role
+		}
+		permissions := map[string]*models.Permission{}
+		for _, spec := range constants.Permissions {
+			status := enums.StatusOk
+			if spec.Code == target.Code {
+				status = enums.StatusDisabled
+			}
+			item := &models.Permission{Name: spec.Name, Code: spec.Code, Type: spec.Type, GroupName: spec.GroupName, Method: spec.Method, APIPath: spec.APIPath, SortNo: spec.SortNo, Status: status, IsBuiltin: true}
+			if err := db.Create(item).Error; err != nil {
+				t.Fatal("create built-in permission")
+			}
+			permissions[item.Code] = item
+		}
+		for code, permissionSpecs := range constants.RolePermissions {
+			for _, spec := range permissionSpecs {
+				if err := db.Create(&models.RolePermission{RoleID: roles[code].ID, PermissionID: permissions[spec.Code].ID}).Error; err != nil {
+					t.Fatal("seed built-in role permission")
+				}
+			}
+		}
+		grantingRole := roles[roleCode]
+		if err := db.Create(&models.UserRole{UserID: alpha.user.ID, RoleID: grantingRole.ID}).Error; err != nil {
+			t.Fatal("assign alpha built-in role")
+		}
+		if _, err := newPermissionService(lifecycle).SyncBuiltinPermissions(); err != nil {
+			t.Fatal("sync built-in permissions")
+		}
+		assertRuntimeSocketClosed(t, alphaA)
+		assertRuntimeSocketClosed(t, alphaB)
+		assertRuntimePingPong(t, betaA)
+		snapshot, err := (employeeAuthStateReader{}).ReadEmployeeSession(alpha.login.ID, time.Now())
+		if err != nil || !slices.Contains(snapshot.Principal.Permissions, target.Code) {
+			t.Fatal("fresh snapshot did not include re-enabled synchronized permission")
+		}
+	case "oidc_default_role_grant":
+		role := models.Role{Code: constants.RoleCodeCsUser, Name: "Support Agent", Status: enums.StatusOk}
+		if err := db.Create(&role).Error; err != nil {
+			t.Fatal("create OIDC default role")
+		}
+		identity := models.UserIdentity{UserID: alpha.user.ID, Provider: enums.ThirdProviderOIDC, ProviderUserID: "synthetic-oidc-subject", ProviderName: "OIDC", RawProfile: "{}", Status: enums.StatusOk}
+		if err := db.Create(&identity).Error; err != nil {
+			t.Fatal("create synthetic OIDC identity")
+		}
+		if _, err := newOIDCLoginService(lifecycle).loginWithOIDCProfile(&oidcLoginProfile{Subject: identity.ProviderUserID, PreferredUsername: alpha.user.Username, RawProfile: "{}"}, config.AuthConfig{TokenTTLHours: 1}, "127.0.0.1", "synthetic-runtime"); err != nil {
+			t.Fatal("complete synthetic OIDC login")
+		}
+		assertRuntimeSocketClosed(t, alphaA)
+		assertRuntimeSocketClosed(t, alphaB)
+		assertRuntimePingPong(t, betaA)
+		var membership models.UserRole
+		if err := db.Where("user_id = ? AND role_id = ?", alpha.user.ID, role.ID).First(&membership).Error; err != nil {
+			t.Fatal("OIDC default role was not persisted")
+		}
+	case "direct_user_permission_crud":
+		permission := models.Permission{Code: "runtime.direct.crud", Name: "Direct CRUD permission", Status: enums.StatusOk}
+		if err := db.Create(&permission).Error; err != nil {
+			t.Fatal("create direct permission")
+		}
+		service := newUserPermissionService(lifecycle)
+		var row models.UserPermission
+		for _, operation := range []string{"create", "update", "updates", "update_column", "delete"} {
+			if operation == "create" {
+				row = models.UserPermission{UserID: alpha.user.ID, PermissionID: permission.ID, Effect: 1}
+				if err := service.Create(&row); err != nil {
+					t.Fatal("create direct override")
+				}
+			} else {
+				conn := runtimeSocket(t, alpha.token)
+				readRuntimeEvent(t, conn, enums.IMRealtimeEventConnected)
+				switch operation {
+				case "update":
+					row.Effect = -1
+					if err := service.Update(&row); err != nil {
+						t.Fatal("update direct override")
+					}
+				case "updates":
+					if err := service.Updates(row.ID, map[string]interface{}{"effect": 1}); err != nil {
+						t.Fatal("update direct override columns")
+					}
+				case "update_column":
+					if err := service.UpdateColumn(row.ID, "effect", -1); err != nil {
+						t.Fatal("update direct override column")
+					}
+				case "delete":
+					if err := service.Delete(row.ID); err != nil {
+						t.Fatal("delete direct override")
+					}
+				}
+				assertRuntimeSocketClosed(t, conn)
+			}
+			if operation == "create" {
+				assertRuntimeSocketClosed(t, alphaA)
+				assertRuntimeSocketClosed(t, alphaB)
+			}
+			assertRuntimePingPong(t, betaA)
+		}
 	case "role_status_current_members":
 		role := models.Role{Code: "runtime-status-role", Name: "Runtime status role", Status: enums.StatusOk}
 		permission := models.Permission{Code: "runtime.status.permission", Name: "Runtime status permission", Status: enums.StatusOk}
@@ -213,6 +385,145 @@ func runEmployeeSessionRuntimeScenario(t *testing.T, scenario string) {
 				t.Fatal("impact fallback unexpectedly revoked a LoginSession row")
 			}
 		}
+	case "pending_revoke_before_registration":
+		short := runtimeShortSession(t, db, alpha.user, time.Hour)
+		if err := LoginSessionService.Revoke(short.login.ID, beta.user.ID, beta.user.Username); err != nil {
+			t.Fatal("revoke session before websocket registration")
+		}
+		assertRuntimeWebSocketRejected(t, short.token)
+		if got := manager.Count(); got != 4 {
+			t.Fatalf("revoked pre-registration session changed manager count: %d", got)
+		}
+		assertRuntimePingPong(t, betaA)
+	case "pending_revoke_after_registration":
+		short := runtimeShortSession(t, db, alpha.user, time.Hour)
+		barrier := &runtimeRevalidationBarrier{employeeRealtimeLifecycle: lifecycle, entered: make(chan struct{}), resume: make(chan struct{})}
+		WsService.lifecycle = barrier
+		server := runtimeRouter()
+		defer server.Close()
+		type dialResult struct {
+			conn     *websocket.Conn
+			response *http.Response
+			err      error
+		}
+		result := make(chan dialResult, 1)
+		go func() {
+			header := http.Header{"Authorization": []string{"Bearer " + short.token}}
+			conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/ws/dashboard", header)
+			result <- dialResult{conn, response, err}
+		}()
+		select {
+		case <-barrier.entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("WebSocket handshake did not reach revalidation barrier")
+		}
+		pending := manager.snapshotEmployeeSessions(short.login.ID, nil, false)
+		if len(pending) != 1 || employeeLifecyclePhase(pending[0].employeePhase.Load()) != employeePhasePending || len(pending[0].Topics) != 0 || pending[0].Closed.Load() {
+			t.Fatal("registered handshake was not a topic-free pending session")
+		}
+		if err := LoginSessionService.Revoke(short.login.ID, beta.user.ID, beta.user.Username); err != nil {
+			t.Fatal("revoke session while handshake revalidation is blocked")
+		}
+		if manager.Count() != 4 {
+			t.Fatal("revoked pending session remained registered")
+		}
+		barrier.release()
+		var dial dialResult
+		select {
+		case dial = <-result:
+		case <-time.After(3 * time.Second):
+			t.Fatal("blocked WebSocket handshake did not finish after revalidation resumed")
+		}
+		if dial.err == nil {
+			if dial.conn == nil {
+				t.Fatal("successful handshake returned no connection")
+			}
+			assertRuntimeSocketClosedEventually(t, dial.conn, time.Second)
+			_ = dial.conn.Close()
+		} else if dial.response == nil || dial.response.StatusCode != http.StatusUnauthorized {
+			t.Fatal("post-revoke handshake did not fail closed")
+		}
+		if manager.Count() != 4 || len(manager.snapshotEmployeeSessions(short.login.ID, nil, false)) != 0 {
+			t.Fatal("revoked pending session was resurrected")
+		}
+		assertRuntimePingPong(t, betaA)
+	case "timer_publication_and_callback_revoke":
+		publicationSession, publicationConn := runtimeConnectAndFindSession(t, manager, alpha)
+		if old := publicationSession.detachLifecycleTimer(); old != nil {
+			old.Stop()
+		}
+		beforePublish, resumePublish := make(chan struct{}), make(chan struct{})
+		installDone := make(chan bool, 1)
+		go func() {
+			installDone <- lifecycle.installLifecycleTimerWithBeforePublish(publicationSession, time.Now().Add(time.Hour), func() { close(beforePublish); <-resumePublish })
+		}()
+		select {
+		case <-beforePublish:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timer installation did not reach publication barrier")
+		}
+		if err := LoginSessionService.Revoke(alpha.login.ID, beta.user.ID, beta.user.Username); err != nil {
+			t.Fatal("revoke during timer publication")
+		}
+		close(resumePublish)
+		select {
+		case installed := <-installDone:
+			if installed {
+				t.Fatal("timer published after revoke closed the session")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timer publication raced into a wait cycle")
+		}
+		if !publicationSession.Closed.Load() || lifecycleTimerReference(publicationSession) != nil || manager.CloseSession(publicationSession) {
+			t.Fatal("publication race did not leave one terminal close with no timer")
+		}
+		assertRuntimeSendClosed(t, publicationSession)
+		assertRuntimeSocketClosed(t, publicationConn)
+		assertRuntimePingPong(t, betaA)
+		fresh := runtimeShortSession(t, db, alpha.user, time.Hour)
+		callbacks := make(chan func(), 1)
+		lifecycle.afterFunc = func(_ time.Duration, callback func()) *time.Timer {
+			callbacks <- callback
+			return time.AfterFunc(time.Hour, callback)
+		}
+		callbackSession, callbackConn := runtimeConnectAndFindSession(t, manager, fresh)
+		var callback func()
+		select {
+		case callback = <-callbacks:
+		case <-time.After(3 * time.Second):
+			t.Fatal("lifecycle timer callback was not captured")
+		}
+		ready := make(chan struct{}, 2)
+		start := make(chan struct{})
+		callbackDone, revokeDone := make(chan struct{}), make(chan error, 1)
+		go func() { ready <- struct{}{}; <-start; callback(); close(callbackDone) }()
+		go func() {
+			ready <- struct{}{}
+			<-start
+			revokeDone <- LoginSessionService.Revoke(fresh.login.ID, beta.user.ID, beta.user.Username)
+		}()
+		<-ready
+		<-ready
+		close(start)
+		select {
+		case <-callbackDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timer callback and revoke deadlocked")
+		}
+		select {
+		case err := <-revokeDone:
+			if err != nil {
+				t.Fatal("revoke racing timer callback failed")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("revoke and timer callback did not complete")
+		}
+		if !callbackSession.Closed.Load() || lifecycleTimerReference(callbackSession) != nil || manager.CloseSession(callbackSession) {
+			t.Fatal("timer callback race did not produce one terminal close and clear timer")
+		}
+		assertRuntimeSendClosed(t, callbackSession)
+		assertRuntimeSocketClosed(t, callbackConn)
+		assertRuntimePingPong(t, betaA)
 	case "idle_login_session_expiry":
 		shortenRuntimeSession(t, db, alpha.login.ID, 300*time.Millisecond)
 		// Reconnect using a dedicated short-lived LoginSession so authoritative
@@ -339,6 +650,39 @@ func runtimeSocket(t *testing.T, token string) *websocket.Conn {
 	return conn
 }
 
+type runtimeRevalidationBarrier struct {
+	*employeeRealtimeLifecycle
+	entered     chan struct{}
+	resume      chan struct{}
+	enteredOnce sync.Once
+	resumeOnce  sync.Once
+}
+
+func (b *runtimeRevalidationBarrier) RevalidateEmployeeSession(id int64, now time.Time) (EmployeeSessionSnapshot, error) {
+	b.enteredOnce.Do(func() { close(b.entered) })
+	<-b.resume
+	return b.employeeRealtimeLifecycle.RevalidateEmployeeSession(id, now)
+}
+
+func (b *runtimeRevalidationBarrier) release() { b.resumeOnce.Do(func() { close(b.resume) }) }
+
+func runtimeConnectAndFindSession(t *testing.T, manager *WsConnectionManager, fixture runtimeEmployeeFixture) (*ClientSession, *websocket.Conn) {
+	t.Helper()
+	previous := make(map[string]struct{})
+	for _, session := range manager.snapshotEmployeeSessions(fixture.login.ID, nil, false) {
+		previous[session.ID] = struct{}{}
+	}
+	conn := runtimeSocket(t, fixture.token)
+	readRuntimeEvent(t, conn, enums.IMRealtimeEventConnected)
+	for _, session := range manager.snapshotEmployeeSessions(fixture.login.ID, nil, false) {
+		if _, existed := previous[session.ID]; !existed && !session.Closed.Load() {
+			return session, conn
+		}
+	}
+	t.Fatal("new runtime WebSocket did not activate an employee session")
+	return nil, nil
+}
+
 func runtimeCustomerSocket(t *testing.T, customerID int64) *websocket.Conn {
 	t.Helper()
 	router := gin.New()
@@ -413,9 +757,41 @@ func assertRuntimeSocketClosed(t *testing.T, conn *websocket.Conn) {
 	}
 }
 
+func assertRuntimeSendClosed(t *testing.T, session *ClientSession) {
+	t.Helper()
+	if session == nil || session.Send == nil {
+		t.Fatal("terminal session has no Send channel")
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case _, ok := <-session.Send:
+			if !ok {
+				return
+			}
+		case <-deadline.C:
+			t.Fatal("Send channel did not close after terminal transition")
+		}
+	}
+}
+
 func assertRuntimeSocketClosedEventually(t *testing.T, conn *websocket.Conn, timeout time.Duration) {
 	t.Helper()
-	assertRuntimeSocketClosed(t, conn)
+	if conn == nil || timeout <= 0 {
+		t.Fatal("socket-close timeout and connection must be valid")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal("set bounded socket-close deadline")
+	}
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("revoked synthetic socket remained open")
+	} else {
+		var networkError net.Error
+		if errors.As(err, &networkError) && networkError.Timeout() {
+			t.Fatalf("synthetic socket did not close within %s", timeout)
+		}
+	}
 }
 
 func assertRuntimePingPong(t *testing.T, conn *websocket.Conn) {
