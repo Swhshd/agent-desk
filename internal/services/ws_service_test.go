@@ -7,7 +7,7 @@ import (
 )
 
 func TestWsNotificationTopic(t *testing.T) {
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	if got := svc.notificationTopic(123); got != "notification:123" {
 		t.Fatalf("expected notification:123, got %q", got)
 	}

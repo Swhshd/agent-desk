@@ -103,7 +103,7 @@ func TestWsSessionCloseAcrossHandlerRoles(t *testing.T) {
 			// Keep role cases serial: the only new pump pair must belong to this
 			// one handler connection. Ambiguous observations fail the test.
 			before := waitWsGoroutineStacks(t, "initial snapshot", func(map[string]string) bool { return true })
-			service := newWsService()
+			service := newWsServiceForTest()
 			peer := tc.open(t, service)
 			if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				t.Fatal(err)
@@ -171,14 +171,14 @@ func TestWsSessionCloseAcrossHandlerRoles(t *testing.T) {
 }
 
 func TestWsSessionCloseSyntheticRuntime(t *testing.T) {
-	service := newWsService()
+	service := newWsServiceForTest()
 	router := gin.New()
 	router.GET("/target", func(ctx *gin.Context) {
-		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: 101})
+		bindEmployeeWsTestSession(t, service, ctx, &dto.AuthPrincipal{UserID: 101})
 		service.HandleDashboardNotificationWS(ctx)
 	})
 	router.GET("/unaffected", func(ctx *gin.Context) {
-		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: 102})
+		bindEmployeeWsTestSession(t, service, ctx, &dto.AuthPrincipal{UserID: 102})
 		service.HandleDashboardNotificationWS(ctx)
 	})
 	server := httptest.NewServer(router)
@@ -338,7 +338,7 @@ func TestWsSessionCloseSyntheticRuntime(t *testing.T) {
 
 func newWsPumpTestSocket(t *testing.T) (*wsService, *websocket.Conn, *ClientSession) {
 	t.Helper()
-	service := newWsService()
+	service := newWsServiceForTest()
 	sessions := make(chan *ClientSession, 1)
 	router := gin.New()
 	router.GET("/ws", func(ctx *gin.Context) {
@@ -369,7 +369,7 @@ func openWsDashboardPumpTestSocket(t *testing.T, service *wsService, userID int6
 	t.Helper()
 	router := gin.New()
 	router.GET("/ws", func(ctx *gin.Context) {
-		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: userID})
+		bindEmployeeWsTestSession(t, service, ctx, &dto.AuthPrincipal{UserID: userID})
 		handler(ctx)
 	})
 	server := httptest.NewServer(router)
@@ -504,7 +504,7 @@ func TestClientSessionEnqueueCharacterization(t *testing.T) {
 }
 
 func TestClientSessionEnqueueCloseLinearization(t *testing.T) {
-	service := newWsService()
+	service := newWsServiceForTest()
 	session := &ClientSession{Send: make(chan []byte, 1)}
 	observedOpen := make(chan struct{})
 	resume := make(chan struct{})
@@ -699,7 +699,7 @@ func TestWsSessionCloseRejectsStaleOperations(t *testing.T) {
 }
 
 func TestWsSessionSubscribeBeforeCloseIsUnregistered(t *testing.T) {
-	service := newWsService()
+	service := newWsServiceForTest()
 	session := &ClientSession{
 		ID:     "subscribe-before-close",
 		Topics: make(map[string]struct{}),
@@ -719,7 +719,7 @@ func TestWsSessionSubscribeBeforeCloseIsUnregistered(t *testing.T) {
 }
 
 func newWsSessionConcurrencyFixture(id string) (*wsService, *ClientSession, string) {
-	service := newWsService()
+	service := newWsServiceForTest()
 	session := &ClientSession{
 		ID:     id,
 		Topics: make(map[string]struct{}),

@@ -17,7 +17,7 @@ import (
 )
 
 func TestDashboardRealtimeDefaultTopics(t *testing.T) {
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	for _, tc := range []struct {
 		name    string
 		session *ClientSession
@@ -74,7 +74,7 @@ func TestEmployeeRealtimeEventClassification(t *testing.T) {
 }
 
 func TestEmployeeRealtimeDeliveryPolicy(t *testing.T) {
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	withView := &ClientSession{Role: realtimeRoleAdmin, Principal: &dto.AuthPrincipal{UserID: 101, Permissions: []string{constants.PermissionConversationView.Code}}}
 	noView := &ClientSession{Role: realtimeRoleAdmin, Principal: &dto.AuthPrincipal{UserID: 101}}
 	for _, tc := range []struct {
@@ -135,7 +135,7 @@ func TestEmployeeRealtimeDeliveryPolicy(t *testing.T) {
 		}
 	}
 	for _, principal := range []*dto.AuthPrincipal{nil, {UserID: 101}} {
-		isolated := newWsService()
+		isolated := newWsServiceForTest()
 		session := captureEmployeeRealtimeSession(t, isolated, "unauthorized", principal, "admin:all", "conversation:42")
 		deliveries := isolated.manager.FindDeliveries([]string{"admin:all", "conversation:42"})
 		if len(deliveries) != 2 {
@@ -151,7 +151,7 @@ func TestEmployeeRealtimeDeliveryPolicy(t *testing.T) {
 }
 
 func TestEmployeeRealtimePolicyIgnoresEnvelopeTopic(t *testing.T) {
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	withView := &ClientSession{Role: realtimeRoleAdmin, Principal: &dto.AuthPrincipal{UserID: 101, Permissions: []string{constants.PermissionConversationView.Code}}}
 	noView := &ClientSession{Role: realtimeRoleAdmin, Principal: &dto.AuthPrincipal{UserID: 101}}
 	event := RealtimeEvent{Type: enums.IMRealtimeEventMessageCreated, Topic: "conversation:42"}
@@ -172,7 +172,7 @@ func TestEmployeeRealtimePolicyIgnoresEnvelopeTopic(t *testing.T) {
 }
 
 func TestWsConnectionManagerFindDeliveries(t *testing.T) {
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	session := captureEmployeeRealtimeSession(t, svc, "two-destinations", &dto.AuthPrincipal{UserID: 101}, "admin:101", "conversation:42")
 	deliveries := svc.manager.FindDeliveries([]string{"admin:101", "conversation:42", "missing"})
 	if len(deliveries) != 2 {
@@ -209,9 +209,9 @@ func TestDashboardWSControlAndSubscription(t *testing.T) {
 			wantTopics = append(wantTopics, "admin:all")
 		}
 		t.Run(name, func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			router := gin.New()
-			router.GET("/ws", func(ctx *gin.Context) { ctx.Set(authPrincipalContextKey, principal); svc.HandleDashboardWS(ctx) })
+			router.GET("/ws", func(ctx *gin.Context) { bindEmployeeWsTestSession(t, svc, ctx, principal); svc.HandleDashboardWS(ctx) })
 			server := httptest.NewServer(router)
 			defer server.Close()
 			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/ws", nil)
@@ -289,8 +289,9 @@ func TestDashboardRealtimeSubscriptionAdmission(t *testing.T) {
 			want = []string{"conversation:42", "admin:101", "admin:all"}
 		}
 		t.Run(name, func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			session := &ClientSession{ID: name, Role: realtimeRoleAdmin, Principal: principal, Topics: make(map[string]struct{})}
+			markActiveEmployeeTestSession(session)
 			svc.manager.Register(session, nil)
 			t.Cleanup(func() { svc.manager.Unregister(session) })
 			// The existing explicit-conversation rejection must remain effective.

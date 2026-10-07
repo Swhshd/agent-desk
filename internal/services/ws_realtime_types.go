@@ -263,20 +263,36 @@ type realtimeClientMessage struct {
 	EventID string   `json:"eventId,omitempty"`
 }
 
+type employeeLifecyclePhase uint32
+
+const (
+	employeePhaseNew employeeLifecyclePhase = iota
+	employeePhasePending
+	employeePhaseActive
+)
+
 type ClientSession struct {
-	ID           string
-	Conn         *websocket.Conn
-	Principal    *dto.AuthPrincipal
-	External     *openidentity.ExternalUser
-	CustomerID   int64
-	Role         string
-	TerminalType string
-	Topics       map[string]struct{}
-	Send         chan []byte
-	Closed       atomic.Bool
-	LastActiveAt atomic.Int64
-	sendMu       sync.Mutex
-	closeOnce    sync.Once
+	EmployeeID            int64
+	LoginSessionID        int64
+	LoginSessionExpiresAt time.Time
+	NextAuthzChangeAt     *time.Time
+	LifecycleDeadline     time.Time
+	employeePhase         atomic.Uint32
+	lifecycleTimerMu      sync.Mutex
+	lifecycleTimer        *time.Timer
+	ID                    string
+	Conn                  *websocket.Conn
+	Principal             *dto.AuthPrincipal
+	External              *openidentity.ExternalUser
+	CustomerID            int64
+	Role                  string
+	TerminalType          string
+	Topics                map[string]struct{}
+	Send                  chan []byte
+	Closed                atomic.Bool
+	LastActiveAt          atomic.Int64
+	sendMu                sync.Mutex
+	closeOnce             sync.Once
 }
 
 func (s *ClientSession) enqueue(payload []byte) bool {

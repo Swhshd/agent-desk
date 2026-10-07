@@ -27,7 +27,7 @@ import (
 // External-ID presence or dropping a customer after its first socket closes
 // must fail this test. Legacy-only registrations cannot establish presence.
 func TestIsCustomerOnlineByCustomerID(t *testing.T) {
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	external := &openidentity.ExternalUser{ExternalSource: enums.ExternalSourceGuest, ExternalID: "synthetic-presence-collision"}
 	a1 := captureCustomerRealtimeSession(t, svc, "synthetic-A1", 41, external)
 	a2 := captureCustomerRealtimeSession(t, svc, "synthetic-A2", 41, external)
@@ -119,7 +119,7 @@ func TestCustomerRealtimeIdentityRuntime(t *testing.T) {
 		}
 	}
 
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	router := gin.New()
 	router.GET("/api/ws/open", svc.HandleOpenWS)
 	server := httptest.NewServer(router)

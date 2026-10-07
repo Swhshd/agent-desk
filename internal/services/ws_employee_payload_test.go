@@ -23,7 +23,7 @@ func employeePrivateMessage() RealtimeMessageCreatedPayload {
 func TestEmployeeFanoutUsesDeliveryTopic(t *testing.T) {
 	for _, topic := range []string{"admin:all", "admin:101"} {
 		t.Run(topic, func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			queue := captureEmployeeRealtimeSession(t, svc, "queue", employeeViewPrincipal(), topic)
 			svc.PublishToTopics([]string{topic}, RealtimeEvent{EventID: "pr2-test", Type: enums.IMRealtimeEventMessageCreated, Topic: "conversation:42", Data: employeePrivateMessage(), At: "synthetic-at"})
 			event := requireCapturedRealtimeEvent(t, queue, enums.IMRealtimeEventMessageCreated)
@@ -35,7 +35,7 @@ func TestEmployeeFanoutUsesDeliveryTopic(t *testing.T) {
 	}
 	for _, p := range []*dto.AuthPrincipal{nil, {UserID: 101}} {
 		t.Run("denied", func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			denied := captureEmployeeRealtimeSession(t, svc, "denied", p, "admin:101", "admin:all", "conversation:42")
 			svc.PublishToTopics([]string{"admin:101", "admin:all", "conversation:42"}, RealtimeEvent{Type: enums.IMRealtimeEventMessageCreated, Topic: "conversation:42", Data: employeePrivateMessage()})
 			requireNoCapturedRealtimeEvent(t, denied)
@@ -78,7 +78,7 @@ func TestEmployeeQueuePayloadAllowlist(t *testing.T) {
 		}{enums.IMRealtimeEventMessageRecalled, recall, employeeRecallQueueKeys})
 		for _, tc := range tests {
 			t.Run(name+"/"+tc.kind, func(t *testing.T) {
-				svc := newWsService()
+				svc := newWsServiceForTest()
 				session := captureEmployeeRealtimeSession(t, svc, "queue", employeeViewPrincipal(), "admin:all")
 				svc.PublishToTopics([]string{"admin:all"}, RealtimeEvent{Type: tc.kind, Topic: "conversation:42", Data: tc.payload})
 				event := requireCapturedRealtimeEvent(t, session, tc.kind)
@@ -102,7 +102,7 @@ func TestEmployeeQueuePayloadAllowlist(t *testing.T) {
 }
 
 func TestEmployeeFullAndCustomerDelivery(t *testing.T) {
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	full := captureEmployeeRealtimeSession(t, svc, "full", employeeViewPrincipal(), "conversation:42")
 	customer := captureEmployeeRealtimeSession(t, svc, "customer", nil, "guest:synthetic")
 	customer.Role = realtimeRoleUser
@@ -124,7 +124,7 @@ func TestEmployeeFullAndCustomerDelivery(t *testing.T) {
 func TestEmployeeMultiDestinationDelivery(t *testing.T) {
 	for _, topics := range [][]string{{"admin:all", "admin:101", "conversation:42", "guest:synthetic"}, {"guest:synthetic", "conversation:42", "admin:101", "admin:all"}} {
 		t.Run(topics[0], func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			full := captureEmployeeRealtimeSession(t, svc, "full", employeeViewPrincipal(), "admin:all", "admin:101", "conversation:42")
 			queue := captureEmployeeRealtimeSession(t, svc, "queue", employeeViewPrincipal(), "admin:all", "admin:101")
 			customer := captureEmployeeRealtimeSession(t, svc, "customer", nil, "conversation:42", "guest:synthetic")
@@ -162,7 +162,7 @@ func TestEmployeePayloadFailsClosed(t *testing.T) {
 		{"recall mismatch", enums.IMRealtimeEventMessageRecalled, message}, {"conversation mismatch", enums.IMRealtimeEventConversationRead, message}, {"resync mismatch", enums.IMRealtimeEventResyncRequired, message}, {"connected mismatch", enums.IMRealtimeEventConnected, message}, {"topics mismatch", enums.IMRealtimeEventSubscribed, message}, {"pong mismatch", enums.IMRealtimeEventPong, message},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			queue := captureEmployeeRealtimeSession(t, svc, "queue", employeeViewPrincipal(), "admin:all")
 			full := captureEmployeeRealtimeSession(t, svc, "full", employeeViewPrincipal(), "conversation:42")
 			svc.PublishToTopics([]string{"admin:all", "conversation:42"}, RealtimeEvent{Type: tc.kind, Topic: "conversation:42", Data: tc.data})
@@ -177,7 +177,7 @@ func TestEmployeeControlAndResyncDelivery(t *testing.T) {
 		data RealtimeEventPayload
 	}{{enums.IMRealtimeEventConnected, RealtimeConnectedPayload{ConnID: "synthetic"}}, {enums.IMRealtimeEventSubscribed, RealtimeTopicsPayload{Topics: []string{"admin:101"}}}, {enums.IMRealtimeEventUnsubscribed, RealtimeTopicsPayload{Topics: []string{"admin:101"}}}, {enums.IMRealtimeEventPong, nil}, {enums.IMRealtimeEventResyncRequired, RealtimeResyncRequiredPayload{Reason: "synthetic-reason"}}} {
 		t.Run(tc.kind, func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			withView := captureEmployeeRealtimeSession(t, svc, "with", employeeViewPrincipal(), "admin:101")
 			noView := captureEmployeeRealtimeSession(t, svc, "without", &dto.AuthPrincipal{UserID: 101}, "admin:101")
 			event := RealtimeEvent{Type: tc.kind, Data: tc.data}

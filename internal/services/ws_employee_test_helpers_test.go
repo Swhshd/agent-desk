@@ -31,7 +31,7 @@ func setupEmployeePublicationTest(t *testing.T) (*gorm.DB, *wsService) {
 	}
 	employeePublicationFixtureInstalled = true
 	db := openHumanDispatchRealtimeTestDB(t, true)
-	WsService = newWsService()
+	WsService = newWsServiceForTest()
 	TriggerAIReplyAsyncHook = nil
 	// Keep the sole fixture and globals installed through child exit: asynchronous
 	// assignment callbacks may still resolve them after t.Cleanup would run.
@@ -82,6 +82,7 @@ func assertEmployeeQueueData(t *testing.T, event capturedRealtimeEvent, allowedK
 func captureEmployeeRealtimeSession(t *testing.T, svc *wsService, id string, principal *dto.AuthPrincipal, topics ...string) *ClientSession {
 	t.Helper()
 	session := &ClientSession{ID: id, Role: realtimeRoleAdmin, Principal: principal, Topics: make(map[string]struct{}), Send: make(chan []byte, realtimeSendBufferSize)}
+	markActiveEmployeeTestSession(session)
 	svc.manager.Register(session, topics)
 	t.Cleanup(func() { svc.manager.Unregister(session) })
 	return session

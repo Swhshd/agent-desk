@@ -23,22 +23,26 @@ import (
 	"github.com/mlogclub/simple/web"
 )
 
-var WsService = newWsService()
+var employeeWSManager = newWsConnectionManager()
+var employeeRealtime = newEmployeeRealtimeLifecycle(employeeWSManager, employeeAuthStateReader{})
+var WsService = newWsService(employeeWSManager, employeeRealtime)
 
 type wsService struct {
-	upgrader websocket.Upgrader
-	seq      atomic.Uint64
-	manager  *WsConnectionManager
+	upgrader  websocket.Upgrader
+	seq       atomic.Uint64
+	manager   *WsConnectionManager
+	lifecycle EmployeeSessionLifecycle
 }
 
-func newWsService() *wsService {
+func newWsService(manager *WsConnectionManager, lifecycle EmployeeSessionLifecycle) *wsService {
 	return &wsService{
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
 		},
-		manager: newWsConnectionManager(),
+		manager:   manager,
+		lifecycle: lifecycle,
 	}
 }
 
@@ -248,37 +252,7 @@ func (s *wsService) writePump(session *ClientSession) {
 }
 
 func (s *wsService) closeSession(session *ClientSession) {
-	if session == nil {
-		return
-	}
-	session.closeOnce.Do(func() {
-		session.sendMu.Lock()
-		session.Closed.Store(true)
-		close(session.Send)
-		session.sendMu.Unlock()
-
-		remaining := s.manager.Unregister(session)
-		if session.Conn != nil {
-			_ = session.Conn.Close()
-		}
-
-		var discUserID int64
-		var discExternalID string
-		if session.Principal != nil {
-			discUserID = session.Principal.UserID
-		}
-		if session.External != nil {
-			discExternalID = strings.TrimSpace(session.External.ExternalID)
-		}
-		slog.Info("realtime client disconnected",
-			"connId", session.ID,
-			"role", session.Role,
-			"userId", discUserID,
-			"externalId", discExternalID,
-			"terminalType", session.TerminalType,
-			"sessionCount", remaining,
-		)
-	})
+	s.manager.CloseSession(session)
 }
 
 func (s *wsService) subscribeTopics(session *ClientSession, topics []string) []string {

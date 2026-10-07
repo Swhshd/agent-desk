@@ -48,7 +48,7 @@ func TestUpgradeConnectionUsesVerifiedCustomerIDNotClientQuery(t *testing.T) {
 		t.Fatalf("verify synthetic session: %v", err)
 	}
 
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	upgraded := make(chan error, 1)
 	router := gin.New()
 	router.GET("/ws", func(ctx *gin.Context) {
