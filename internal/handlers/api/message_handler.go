@@ -3,7 +3,6 @@ package api
 import (
 	"agent-desk/internal/builders"
 	"agent-desk/internal/pkg/dto/request"
-	"agent-desk/internal/pkg/enums"
 	"agent-desk/internal/pkg/httpx"
 	"agent-desk/internal/pkg/i18nx"
 	"agent-desk/internal/services"
@@ -37,7 +36,7 @@ func MessageAnyList(ctx *gin.Context) {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0116"))
 		return
 	}
-	if !services.ConversationService.IsCustomerConversationOwner(conversation, *external) {
+	if !services.ConversationService.IsVerifiedCustomerConversationOwner(conversation, httpx.GetVerifiedCustomerID(ctx)) {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0222"))
 		return
 	}
@@ -72,7 +71,7 @@ func MessagePostSend(ctx *gin.Context) {
 		return
 	}
 
-	item, err := services.MessageService.SendCustomerMessageWithRequestID(req.ConversationID, req.ClientMsgID, req.MessageType, req.Content, req.Payload, *external, httpx.GetRequestID(ctx))
+	item, err := services.MessageService.SendVerifiedCustomerMessageWithRequestID(req.ConversationID, httpx.GetVerifiedCustomerID(ctx), req.ClientMsgID, req.MessageType, req.Content, req.Payload, *external, httpx.GetRequestID(ctx))
 	if err != nil {
 		httpx.WriteJSON(ctx, err)
 		return
@@ -96,7 +95,7 @@ func MessagePostRead(ctx *gin.Context) {
 		httpx.WriteJSON(ctx, err)
 		return
 	}
-	if err := services.ConversationService.MarkCustomerConversationReadToMessage(req.ConversationID, req.MessageID, external); err != nil {
+	if err := services.ConversationService.MarkVerifiedCustomerConversationReadToMessage(req.ConversationID, req.MessageID, httpx.GetVerifiedCustomerID(ctx), external); err != nil {
 		httpx.WriteJSON(ctx, err)
 		return
 	}
@@ -124,16 +123,7 @@ func MessagePostUpload_image(ctx *gin.Context) {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0064"))
 		return
 	}
-	conversation := services.ConversationService.Get(conversationID)
-	if conversation == nil {
-		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0116"))
-		return
-	}
-	if !services.ConversationService.IsCustomerConversationOwner(conversation, *external) {
-		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0222"))
-		return
-	}
-	if _, err := services.MessageService.ValidateConversationSender(conversationID, enums.IMSenderTypeCustomer, nil, external); err != nil {
+	if _, err := services.MessageService.ValidateVerifiedCustomerSender(conversationID, httpx.GetVerifiedCustomerID(ctx), external); err != nil {
 		httpx.WriteJSON(ctx, err)
 		return
 	}
@@ -177,7 +167,7 @@ func MessagePostUpload_attachment(ctx *gin.Context) {
 		httpx.WriteJSON(ctx, httpx.JsonErrorMsg(ctx, "error.e0064"))
 		return
 	}
-	if _, err := services.MessageService.ValidateConversationSender(conversationID, enums.IMSenderTypeCustomer, nil, external); err != nil {
+	if _, err := services.MessageService.ValidateVerifiedCustomerSender(conversationID, httpx.GetVerifiedCustomerID(ctx), external); err != nil {
 		httpx.WriteJSON(ctx, err)
 		return
 	}

@@ -106,15 +106,15 @@ func TestCustomerRealtimeIdentityRuntime(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		conversation *models.Conversation
-		external     openidentity.ExternalUser
+		customerID   int64
 		want         bool
 	}{
-		{"A owns A", conversationA, externalA, true},
-		{"B owns B", conversationB, externalB, true},
-		{"A cannot own B", conversationB, externalA, false},
-		{"B cannot own A", conversationA, externalB, false},
+		{"A owns A", conversationA, 41, true},
+		{"B owns B", conversationB, 42, true},
+		{"A cannot own B", conversationB, 41, false},
+		{"B cannot own A", conversationA, 42, false},
 	} {
-		if got := ConversationService.IsCustomerConversationOwner(tc.conversation, tc.external); got != tc.want {
+		if got := ConversationService.IsVerifiedCustomerConversationOwner(tc.conversation, tc.customerID); got != tc.want {
 			t.Fatalf("REST ownership %s = %v, want %v", tc.name, got, tc.want)
 		}
 	}

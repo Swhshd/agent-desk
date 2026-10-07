@@ -528,12 +528,30 @@ func (s *conversationService) MarkCustomerConversationReadToMessage(conversation
 	if !s.IsCustomerConversationOwner(conversation, *external) {
 		return errorsx.ForbiddenI18n("error.e0222")
 	}
+	return s.markCustomerConversationRead(conversation, messageID, external)
+}
+
+func (s *conversationService) MarkVerifiedCustomerConversationReadToMessage(conversationID, messageID, customerID int64, external *openidentity.ExternalUser) error {
+	if customerID <= 0 || external == nil || strings.TrimSpace(external.ExternalID) == "" || strings.TrimSpace(string(external.ExternalSource)) == "" {
+		return errorsx.UnauthorizedI18n("error.e0149")
+	}
+	conversation := s.Get(conversationID)
+	if conversation == nil {
+		return errorsx.InvalidParamI18n("error.e0116")
+	}
+	if !s.IsVerifiedCustomerConversationOwner(conversation, customerID) {
+		return errorsx.ForbiddenI18n("error.e0222")
+	}
+	return s.markCustomerConversationRead(conversation, messageID, external)
+}
+
+func (s *conversationService) markCustomerConversationRead(conversation *models.Conversation, messageID int64, external *openidentity.ExternalUser) error {
 	changed, err := s.markConversationReadWithActor(conversation, messageID, customerConversationReadActor{external: external})
 	if err != nil {
 		return err
 	}
 	if changed {
-		if updated := s.Get(conversationID); updated != nil {
+		if updated := s.Get(conversation.ID); updated != nil {
 			WsService.PublishConversationChanged(updated, enums.IMRealtimeEventConversationRead)
 		}
 	}
@@ -695,7 +713,7 @@ func (s *conversationService) IsVerifiedCustomerConversationOwner(conversation *
 }
 
 func (s *conversationService) IsCustomerConversationOwner(conversation *models.Conversation, externalUser openidentity.ExternalUser) bool {
-	if conversation == nil {
+	if conversation == nil || externalUser.ExternalSource == enums.ExternalSourceGuest {
 		return false
 	}
 	extID := strings.TrimSpace(externalUser.ExternalID)

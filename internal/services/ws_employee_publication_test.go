@@ -88,7 +88,7 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 			}
 			sendCustomer := func() *models.Message {
 				t.Helper()
-				m, err := MessageService.SendCustomerMessageWithRequestID(conv.ID, "synthetic-customer-"+family, enums.IMMessageTypeText, "synthetic-publication-marker", "", external, "synthetic-request")
+				m, err := MessageService.SendVerifiedCustomerMessageWithRequestID(conv.ID, conv.CustomerID, "synthetic-customer-"+family, enums.IMMessageTypeText, "synthetic-publication-marker", "", external, "synthetic-request")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -161,7 +161,7 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 				setConversation(enums.IMConversationStatusActive, 101)
 				message := sendAgent()
 				drainEmployeePublication(queue, full, customer, denied, missing)
-				err = ConversationService.MarkCustomerConversationReadToMessage(conv.ID, message.ID, &external)
+				err = ConversationService.MarkVerifiedCustomerConversationReadToMessage(conv.ID, message.ID, conv.CustomerID, &external)
 				expected = []string{enums.IMRealtimeEventConversationRead}
 			case "dispatch", "assigned handoff", "pool handoff":
 				createHumanDispatchRealtimeTeam(t, db, 1)
@@ -281,7 +281,7 @@ func TestEmployeeRealtimePublicationFamilies(t *testing.T) {
 				if err := db.Create(observerConversation).Error; err != nil {
 					t.Fatal(err)
 				}
-				if _, err := MessageService.SendCustomerMessageWithRequestID(observerConversation.ID, "synthetic-B-owned-message", enums.IMMessageTypeText, "synthetic-owner-B-marker", "", observerExternal, "synthetic-B-request"); err != nil {
+				if _, err := MessageService.SendVerifiedCustomerMessageWithRequestID(observerConversation.ID, observerConversation.CustomerID, "synthetic-B-owned-message", enums.IMMessageTypeText, "synthetic-owner-B-marker", "", observerExternal, "synthetic-B-request"); err != nil {
 					t.Fatal(err)
 				}
 				message := requireCapturedRealtimeEvent(t, observer, enums.IMRealtimeEventMessageCreated)
