@@ -2,6 +2,14 @@ import { request } from "@/lib/api/client"
 import { translateCurrentMessage } from "@/i18n/messages"
 import { readSupportChatRuntimeConfig } from "@/lib/sdk/runtime-config"
 import { generateUUID } from "@/lib/utils"
+import {
+  activateCustomerSessionScope,
+  beginCustomerSessionAttempt,
+  captureCustomerSessionScope,
+  invalidateCustomerSessionScope,
+  isCustomerSessionAttemptCurrent,
+  type CustomerSessionAttempt,
+} from "@/lib/api/im-session-scope"
 
 export type Paging = {
   page: number
@@ -171,17 +179,32 @@ function getRuntimeImConfig() {
 }
 
 function parseExpiresAt(value: string) {
+  if (typeof value !== "string") {
+    return 0
+  }
   const normalized = value.trim().replace(" ", "T")
   const timestamp = Date.parse(normalized)
   return Number.isFinite(timestamp) ? timestamp : 0
+}
+
+function hasUsableCustomerSession(session: ImCustomerSession | null): session is ImCustomerSession {
+  return Boolean(
+    session &&
+    typeof session.customerSessionToken === "string" && session.customerSessionToken.trim() &&
+    typeof session.expiresAt === "string" && parseExpiresAt(session.expiresAt) > 0 &&
+    typeof session.identityKey === "string" && session.identityKey.trim() &&
+    typeof session.channelId === "string" && session.channelId.trim() &&
+    Number.isInteger(session.customer?.id) && session.customer.id > 0 &&
+    typeof session.customer.name === "string"
+  )
 }
 
 function isCustomerSessionValid(
   session: ImCustomerSession | null,
   channelId?: string,
   identityKey?: string
-) {
-  if (!session?.customerSessionToken || !session.expiresAt) {
+): session is ImCustomerSession {
+  if (!hasUsableCustomerSession(session)) {
     return false
   }
   if (channelId && session.channelId !== channelId) {
@@ -258,8 +281,70 @@ function createChannelHeaders() {
   }
 }
 
-function createExchangeHeaders() {
+type RuntimeImConfig = ReturnType<typeof getRuntimeImConfig>
+
+function guestIdentityKey(config: RuntimeImConfig) {
+  return `guest:${config.externalId || getGuestId()}`
+}
+
+function customerSessionRequestKey(config: RuntimeImConfig, createGuestId = true) {
+  const externalId = config.userToken ? "" : config.externalId || (createGuestId
+    ? getGuestId()
+    : typeof window === "undefined" ? "" : window.localStorage.getItem(GUEST_STORAGE_KEY)?.trim() || "")
+  return JSON.stringify(config.userToken
+    ? [config.channelId, "user", config.userToken]
+    : [config.channelId, "guest", externalId])
+}
+
+export function beginCustomerSessionBootstrap(): CustomerSessionAttempt {
+  return beginCustomerSessionAttempt(customerSessionRequestKey(getRuntimeImConfig()))
+}
+
+function canReuseSession(config: RuntimeImConfig, cached: ImCustomerSession | null) {
+  if (config.userToken) {
+    return entryUserTokenExchangeKey === `${config.channelId}:${config.userToken}` &&
+      isCustomerSessionValid(cached, config.channelId)
+  }
+  return isCustomerSessionValid(cached, config.channelId, guestIdentityKey(config))
+}
+
+export function canReuseCustomerSession(): boolean {
+  return canReuseSession(getRuntimeImConfig(), readCustomerSession())
+}
+
+export function isCustomerSessionContinuityLost(): boolean {
   const config = getRuntimeImConfig()
+  const cached = readCustomerSession()
+  if (!hasUsableCustomerSession(cached) || parseExpiresAt(cached.expiresAt) <= Date.now()) {
+    return true
+  }
+  if (cached.channelId !== config.channelId) {
+    return true
+  }
+  // A changed host token requires exchange, but does not itself identify a new customer.
+  return config.userToken
+    ? !cached.identityKey.startsWith("user:")
+    : cached.identityKey !== guestIdentityKey(config)
+}
+
+export function departCustomerSessionIdentity(): void {
+  if (captureCustomerSessionScope()) {
+    invalidateCustomerSessionScope()
+  }
+  if (typeof window !== "undefined") {
+    window.sessionStorage.removeItem(CUSTOMER_SESSION_STORAGE_KEY)
+  }
+  entryUserTokenExchangeKey = ""
+}
+
+function assertCustomerSessionAttempt(attempt: CustomerSessionAttempt, config?: RuntimeImConfig) {
+  if (!isCustomerSessionAttemptCurrent(attempt) ||
+    (config && attempt.requestKey !== customerSessionRequestKey(config, false))) {
+    throw new Error(translateCurrentMessage("api.customerSessionNotReady"))
+  }
+}
+
+function createExchangeHeaders(config: RuntimeImConfig) {
   const headers: Record<string, string> = {
     "X-Channel-Id": config.channelId,
   }
@@ -269,6 +354,14 @@ function createExchangeHeaders() {
     headers["X-External-Id"] = config.externalId || getGuestId()
     if (config.externalName) {
       headers["X-External-Name"] = encodeURIComponent(config.externalName)
+    }
+    const cached = readCustomerSession()
+    // Direct cache reuse has a five-second margin; exchange proof uses actual expiry.
+    if (hasUsableCustomerSession(cached) &&
+      cached.channelId === config.channelId &&
+      cached.identityKey === guestIdentityKey(config) &&
+      parseExpiresAt(cached.expiresAt) > Date.now()) {
+      headers[CUSTOMER_SESSION_TOKEN_HEADER] = cached.customerSessionToken
     }
   }
   return {
@@ -322,48 +415,61 @@ function toQueryString(query?: Record<string, string | number | undefined>) {
   return output ? `?${output}` : ""
 }
 
-export async function exchangeCustomerSession() {
+export async function exchangeCustomerSession(attempt?: CustomerSessionAttempt): Promise<ImCustomerSession> {
+  // Reject stale supplied tickets before reading bindings or mutating any storage/scope.
+  const ticket = attempt ?? beginCustomerSessionBootstrap()
+  assertCustomerSessionAttempt(ticket)
   const config = getRuntimeImConfig()
+  assertCustomerSessionAttempt(ticket, config)
+  if (isCustomerSessionContinuityLost()) {
+    departCustomerSessionIdentity()
+  }
   const result = await request<ImCustomerSessionExchangeResponse>(
     "/api/customer/session_exchange",
     {
       method: "POST",
       skipAuth: true,
       baseUrl: config.baseUrl,
-      headers: createExchangeHeaders(),
+      headers: createExchangeHeaders(config),
     }
   )
+  const currentConfig = getRuntimeImConfig()
+  assertCustomerSessionAttempt(ticket, currentConfig)
+  if (currentConfig.baseUrl !== config.baseUrl) {
+    throw new Error(translateCurrentMessage("api.customerSessionNotReady"))
+  }
   const session = {
     ...result,
     channelId: config.channelId,
+  }
+  if (!hasUsableCustomerSession(session) || parseExpiresAt(session.expiresAt) <= Date.now() ||
+    (config.userToken
+      ? !session.identityKey.startsWith("user:")
+      : session.identityKey !== guestIdentityKey(config))) {
+    throw new Error(translateCurrentMessage("api.customerSessionNotReady"))
   }
   writeCustomerSession(session)
   if (config.userToken) {
     entryUserTokenExchangeKey = `${config.channelId}:${config.userToken}`
   }
+  activateCustomerSessionScope(session)
   return session
 }
 
-export async function ensureCustomerSession() {
+export async function ensureCustomerSession(attempt?: CustomerSessionAttempt): Promise<ImCustomerSession> {
+  const ticket = attempt ?? beginCustomerSessionBootstrap()
+  assertCustomerSessionAttempt(ticket)
   const config = getRuntimeImConfig()
-  const cached = readCustomerSession()
-  if (config.userToken) {
-    const exchangeKey = `${config.channelId}:${config.userToken}`
-    if (
-      entryUserTokenExchangeKey === exchangeKey &&
-      isCustomerSessionValid(cached, config.channelId)
-    ) {
-      return cached
-    }
-    return exchangeCustomerSession()
+  assertCustomerSessionAttempt(ticket, config)
+  if (isCustomerSessionContinuityLost()) {
+    departCustomerSessionIdentity()
   }
-
-  const externalId = config.externalId || getGuestId()
-  const identityKey = `guest:${externalId}`
-  if (isCustomerSessionValid(cached, config.channelId, identityKey)) {
+  const cached = readCustomerSession()
+  if (cached && canReuseSession(config, cached)) {
+    activateCustomerSessionScope(cached)
     return cached
   }
-  return exchangeCustomerSession()
+  return exchangeCustomerSession(ticket)
 }
 
 export function fetchImConversationDetail(id: number) {
