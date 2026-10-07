@@ -24,7 +24,7 @@ test("customer WebSocket keeps the existing endpoint and does not build a topic"
 
 test("connected topic values are ignored and customer events use payload conversationId", () => {
   const handlerStart = supportChatSource.indexOf(
-    "    onMessage: (messageEvent) => {"
+    "    onMessage: (messageEvent, socket) => {"
   )
   const handlerEnd = supportChatSource.indexOf("\n  })", handlerStart)
   assert.ok(handlerStart >= 0, "support-chat realtime message handler exists")

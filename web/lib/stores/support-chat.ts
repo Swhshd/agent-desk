@@ -23,7 +23,12 @@ import {
   type ImMessage,
   type ImWidgetConfig,
 } from "@/lib/api/im"
-import { isCustomerSessionAttemptCurrent } from "@/lib/api/im-session-scope"
+import {
+  captureCustomerSessionScope,
+  isCustomerSessionAttemptCurrent,
+  isCustomerSessionScopeCurrent,
+  type CustomerSessionScope,
+} from "@/lib/api/im-session-scope"
 import {
   createImRealtimeConnection,
   type ImRealtimeEnvelope,
@@ -57,14 +62,21 @@ function getNotificationBody(message: ImMessage): string {
   return summarizeIMMessage(message)
 }
 
-function showNotification(title: string, body: string, onClick?: () => void) {
+function showNotification(title: string, body: string, isCurrent: () => boolean, onClick?: () => void) {
   if (typeof window === "undefined" || !("Notification" in window)) {
     return
   }
 
   const create = () => {
+    if (!isCurrent()) {
+      return
+    }
     const notification = new Notification(title, { body })
     notification.onclick = () => {
+      if (!isCurrent()) {
+        notification.close()
+        return
+      }
       window.focus()
       onClick?.()
       notification.close()
@@ -159,8 +171,18 @@ function t(key: string) {
 
 export const useSupportChatStore = create<SupportChatStore>((set, get) => {
   let resettingCustomerState = false
+  const socketScopes = new WeakMap<WebSocket, CustomerSessionScope>()
+  const isCurrentConversation = (scope: CustomerSessionScope | null, conversationId: number) =>
+    isCustomerSessionScopeCurrent(scope) && get().conversation?.id === conversationId
   const realtime = createRealtimeConnectionManager({
-    createSocket: createImRealtimeConnection,
+    createSocket: () => {
+      const scope = captureCustomerSessionScope()
+      const socket = createImRealtimeConnection()
+      if (scope) {
+        socketScopes.set(socket, scope)
+      }
+      return socket
+    },
     canReconnect: () => Boolean(get().isOpen && get().conversation?.id),
     onStatusChange: (status) => {
       if (!resettingCustomerState && (get().isOpen || status === "disconnected")) {
@@ -172,7 +194,11 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
         set({ socket })
       }
     },
-    onMessage: (messageEvent) => {
+    onMessage: (messageEvent, socket) => {
+      const scope = socketScopes.get(socket) ?? null
+      if (!isCustomerSessionScopeCurrent(scope)) {
+        return
+      }
       let event: ImRealtimeEnvelope
       try {
         event = JSON.parse(messageEvent.data) as ImRealtimeEnvelope
@@ -182,7 +208,7 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
 
       const payload = event.data ?? event.payload
       if (event.type === "customer_session.refresh") {
-        applyCustomerSessionRefresh(payload)
+        applyCustomerSessionRefresh(payload, scope)
         return
       }
 
@@ -215,10 +241,15 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           document.visibilityState !== "visible"
         ) {
           const state = get()
-          showNotification(t("supportChat.newMessage"), getNotificationBody(message), () => {
-            state.setIsOpen(true)
-            state.setIsVisible(true)
-          })
+          showNotification(
+            t("supportChat.newMessage"),
+            getNotificationBody(message),
+            () => isCurrentConversation(scope, conversationId),
+            () => {
+              state.setIsOpen(true)
+              state.setIsVisible(true)
+            }
+          )
         }
         return
       }
@@ -409,6 +440,7 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
     },
 
     refreshMessages: async () => {
+      const scope = captureCustomerSessionScope()
       const conversationId = get().conversation?.id
       if (!conversationId) {
         return
@@ -419,6 +451,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           conversationId,
           limit: DEFAULT_PAGE_LIMIT,
         })
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         const results = ensureMessageList(page.results)
         set({
           messages: results,
@@ -426,6 +461,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           messagesHasMore: Boolean(page.hasMore) || results.length >= DEFAULT_PAGE_LIMIT,
         })
       } catch (error) {
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set({
           error: error instanceof Error ? error.message : t("supportChat.loadMessagesFailed"),
         })
@@ -434,6 +472,7 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
     },
 
     syncLatestMessages: async () => {
+      const scope = captureCustomerSessionScope()
       const conversationId = get().conversation?.id
       if (!conversationId) {
         return
@@ -444,6 +483,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           conversationId,
           limit: DEFAULT_PAGE_LIMIT,
         })
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         const batch = ensureMessageList(page.results)
         if (batch.length === 0) {
           return
@@ -462,6 +504,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           }
         })
       } catch (error) {
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set({
           error: error instanceof Error ? error.message : t("supportChat.syncMessagesFailed"),
         })
@@ -469,6 +514,7 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
     },
 
     loadOlderMessages: async () => {
+      const scope = captureCustomerSessionScope()
       const conversationId = get().conversation?.id
       if (
         !conversationId ||
@@ -490,6 +536,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           cursor: cursorId,
           limit: DEFAULT_PAGE_LIMIT,
         })
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         const results = ensureMessageList(page.results)
         set((state) => {
           const merged = mergeImMessagesByIdAsc(
@@ -504,6 +553,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           }
         })
       } catch (error) {
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set({
           messagesLoadingMore: false,
           error: error instanceof Error ? error.message : t("supportChat.loadHistoryFailed"),
@@ -513,6 +565,7 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
     },
 
     markConversationRead: async () => {
+      const scope = captureCustomerSessionScope()
       const state = get()
       const conversation = state.conversation
       const lastMessage = state.messages.at(-1)
@@ -533,6 +586,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
       set({ readingMessageId: lastMessage.id })
       try {
         await markImMessageRead(conversation.id, lastMessage.id)
+        if (!isCurrentConversation(scope, conversation.id)) {
+          return
+        }
         set((current) => ({
           readingMessageId: 0,
           messages: current.messages.map((item) => {
@@ -550,12 +606,16 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
             : null,
         }))
       } catch (error) {
+        if (!isCurrentConversation(scope, conversation.id)) {
+          return
+        }
         set({ readingMessageId: 0 })
         throw error
       }
     },
 
     handleSendMessage: async (content: string) => {
+      const scope = captureCustomerSessionScope()
       const conversationId = get().conversation?.id
       if (!conversationId) {
         return
@@ -569,6 +629,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           content,
           clientMsgId: `support_chat_html_${generateUUID()}`,
         })
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set((state) => ({
           sending: false,
           messages: state.messages.some((message) => message.id === nextMessage.id)
@@ -587,6 +650,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
             : null,
         }))
       } catch (error) {
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set({
           sending: false,
           error: error instanceof Error ? error.message : t("supportChat.sendMessageFailed"),
@@ -600,6 +666,7 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
     },
 
     uploadMessageImage: async (file: File) => {
+      const scope = captureCustomerSessionScope()
       const conversationId = get().conversation?.id
       if (!conversationId) {
         return null
@@ -607,18 +674,25 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
 
       set({ error: "", uploadingAsset: true })
       try {
-        return await uploadImImage(conversationId, file)
+        const asset = await uploadImImage(conversationId, file)
+        return isCurrentConversation(scope, conversationId) ? asset : null
       } catch (error) {
+        if (!isCurrentConversation(scope, conversationId)) {
+          return null
+        }
         set({
           error: error instanceof Error ? error.message : t("supportChat.uploadImageFailed"),
         })
         return null
       } finally {
-        set({ uploadingAsset: false })
+        if (isCurrentConversation(scope, conversationId)) {
+          set({ uploadingAsset: false })
+        }
       }
     },
 
     sendAttachment: async (file: File) => {
+      const scope = captureCustomerSessionScope()
       const conversationId = get().conversation?.id
       if (!conversationId) {
         return
@@ -627,6 +701,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
       set({ error: "", uploadingAsset: true })
       try {
         const asset = await uploadImAttachment(conversationId, file)
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         const nextMessage = await sendImMessage({
           conversationId,
           messageType: "attachment",
@@ -634,6 +711,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
           payload: JSON.stringify({ assetId: asset.assetId }),
           clientMsgId: `support_chat_attachment_${generateUUID()}`,
         })
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set((state) => ({
           uploadingAsset: false,
           messages: state.messages.some((message) => message.id === nextMessage.id)
@@ -652,6 +732,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
             : null,
         }))
       } catch (error) {
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set({
           uploadingAsset: false,
           error: error instanceof Error ? error.message : t("supportChat.sendAttachmentFailed"),
@@ -661,6 +744,7 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
     },
 
     closeConversation: async () => {
+      const scope = captureCustomerSessionScope()
       const conversationId = get().conversation?.id
       if (!conversationId) {
         return
@@ -669,6 +753,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
       set({ error: "", closingConversation: true })
       try {
         await closeImConversation(conversationId)
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         closeSocket({ reconnect: false })
         set((state) => ({
           closingConversation: false,
@@ -681,6 +768,9 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
             : null,
         }))
       } catch (error) {
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set({
           closingConversation: false,
           error: error instanceof Error ? error.message : t("supportChat.closeConversationFailed"),
@@ -690,17 +780,25 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
     },
 
     retry: async () => {
-      if (!get().conversation?.id) {
+      const scope = captureCustomerSessionScope()
+      const conversationId = get().conversation?.id
+      if (!conversationId) {
         return
       }
 
       set({ error: "", status: "connecting" })
       try {
         await get().refreshMessages()
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         if (get().isOpen) {
           connectSocket()
         }
       } catch (error) {
+        if (!isCurrentConversation(scope, conversationId)) {
+          return
+        }
         set({
           status: "disconnected",
           error: error instanceof Error ? error.message : t("supportChat.refreshFailed"),

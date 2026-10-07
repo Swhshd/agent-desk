@@ -21,12 +21,311 @@ const message = (id) => ({
   sendStatus: 1, customerRead: true, agentRead: false,
 })
 
-async function initializedA({ exchange = async () => session(), widget = async () => presentation, match = async (id) => conversation(id) } = {}) {
+const asset = { id: 1, assetId: "fixture-asset", provider: "local", storageKey: "fixture",
+  filename: "fixture.txt", fileSize: 7, mimeType: "text/plain", status: 1, url: "/fixture",
+  createdAt: "", updatedAt: "", createUserId: 0, createUserName: "", updateUserId: 0, updateUserName: "" }
+const history = (content = "late A data") => ({ results: [{ ...message(901), content }],
+  page: { page: 1, limit: 50, total: 1 }, cursor: "902", hasMore: true })
+const refreshResponse = () => new Response(null, { headers: {
+  "X-Customer-Session-Token": "synthetic-late-refresh", "X-Customer-Session-Expires-At": "2026-10-07T03:00:00Z",
+} })
+
+// Missing scope checks at any success/catch/finally boundary must fail this full
+// state snapshot, including flags that B has independently set while A waits.
+function stateSnapshot(h) {
+  const { customer, customerChannelId, conversation, messages, messagesCursor, messagesHasMore,
+    messagesLoadingMore, initialized, error, sending, uploadingAsset, closingConversation,
+    readingMessageId, status, isOpen, isVisible } = h.store.getState()
+  return JSON.parse(JSON.stringify({ customer, customerChannelId, conversation, messages, messagesCursor,
+    messagesHasMore, messagesLoadingMore, initialized, error, sending, uploadingAsset,
+    closingConversation, readingMessageId, status, isOpen, isVisible }))
+}
+
+async function switchToB(h) {
+  writeSession(h, session({ expiresAt: "2026-10-07T01:00:03Z" }))
+  h.store.getState().bootstrap()
+  await h.flush()
+  assert.equal(h.store.getState().customer.id, 202)
+  h.store.setState({ error: "B current error", messagesCursor: "912", messagesHasMore: true,
+    messagesLoadingMore: true, sending: true, uploadingAsset: true, closingConversation: true,
+    readingMessageId: 912, status: "connected" })
+}
+
+async function actionHarness() {
+  let gate = null
+  const h = await initializedA({
+    exchange: async () => session({ customer: { id: 202, name: "B" }, customerSessionToken: "synthetic-proof-B" }),
+    intercept: (path, options) => {
+      if (!gate || !gate.matches(path)) return undefined
+      const active = gate
+      gate = null
+      active.dispatched.resolve({ path, options })
+      return active.completion.promise
+    },
+  })
+  h.hold = (matches = () => true) => {
+    const pending = { matches, completion: deferred(), dispatched: deferred() }
+    gate = pending
+    return pending
+  }
+  return h
+}
+
+const actions = [
+  ["refreshMessages", (h) => h.store.getState().refreshMessages(), () => history()],
+  ["syncLatestMessages", (h) => h.store.getState().syncLatestMessages(), () => history()],
+  ["loadOlderMessages", (h) => { h.store.setState({ messagesHasMore: true, messagesCursor: "902" }); return h.store.getState().loadOlderMessages() }, () => history()],
+  ["handleSendMessage", (h) => h.store.getState().handleSendMessage("A draft"), () => ({ ...message(901), id: 950 })],
+  ["markConversationRead", (h) => { h.store.setState({ conversation: { ...conversation(901), customerUnreadCount: 1, customerLastReadMessageId: 0 } }); return h.store.getState().markConversationRead() }, () => ({})],
+  ["uploadMessageImage", (h) => h.store.getState().uploadMessageImage(new Blob(["fixture"])), () => asset],
+  ["sendAttachment", (h) => h.store.getState().sendAttachment(new Blob(["fixture"])), () => asset],
+  ["closeConversation", (h) => h.store.getState().closeConversation(), () => ({})],
+  ["retry", (h) => h.store.getState().retry(), () => history()],
+]
+
+for (const [name, start, response] of actions) {
+  for (const completion of ["success", "error", ...(name === "uploadMessageImage" ? ["finally"] : [])]) {
+    test(`stale ${name} ${completion} cannot mutate the new customer`, async () => {
+      const h = await actionHarness(), pending = h.hold()
+      const work = start(h).then((value) => ({ value }), (error) => ({ error }))
+      await pending.dispatched.promise
+      await switchToB(h)
+      const before = stateSnapshot(h), socket = h.store.getState().socket, requestCount = h.requests.length
+      if (completion === "error") pending.completion.reject(new Error("late A request failed"))
+      else pending.completion.resolve(response())
+      const result = await work
+      assert.deepEqual(stateSnapshot(h), before, `B state survives A ${name} ${completion}`)
+      assert.ok(h.store.getState().socket === socket, "B socket survives completion")
+      assert.equal(h.requests.length, requestCount, "obsolete work cannot dispatch a second request or reconnect")
+      if (name === "uploadMessageImage") assert.equal(result.value, null, "obsolete upload cannot return an insertable A asset")
+    })
+  }
+}
+
+for (const completion of ["success", "error"]) {
+  test(`stale sendAttachment ${completion} cannot mutate the new customer after send dispatch`, async () => {
+    const h = await actionHarness(), upload = h.hold()
+    const work = h.store.getState().sendAttachment(new Blob(["fixture"])).catch(() => {})
+    await upload.dispatched.promise
+    const send = h.hold()
+    upload.completion.resolve(asset)
+    const request = await send.dispatched.promise
+    assert.equal(JSON.parse(request.options.body).conversationId, 901)
+    await switchToB(h)
+    const before = stateSnapshot(h)
+    if (completion === "error") send.completion.reject(new Error("late send failed"))
+    else send.completion.resolve({ ...message(901), id: 950 })
+    await work
+    assert.deepEqual(stateSnapshot(h), before)
+  })
+}
+
+test("stale refreshMessages success cannot mutate the new customer when conversation id is reused", async () => {
+  const h = await actionHarness(), pending = h.hold()
+  const work = h.store.getState().refreshMessages()
+  await pending.dispatched.promise
+  await switchToB(h)
+  h.store.setState({ conversation: { ...conversation(901), customerName: "B" } })
+  const before = stateSnapshot(h)
+  pending.completion.resolve(history())
+  await work
+  assert.deepEqual(stateSnapshot(h), before, "identity epoch must be checked independently of conversation id")
+})
+
+test("same customer conversation replacement rejects pending history", async () => {
+  const h = await actionHarness(), pending = h.hold()
+  const work = h.store.getState().refreshMessages()
+  await pending.dispatched.promise
+  h.store.setState({ conversation: conversation(911), messages: [message(911)] })
+  const before = stateSnapshot(h)
+  pending.completion.resolve(history())
+  await work
+  assert.deepEqual(stateSnapshot(h), before)
+})
+
+for (const completion of ["success", "error"]) {
+  test(`stale retry ${completion} cannot mutate the new customer after its refresh settles`, async () => {
+    const h = await actionHarness(), pending = h.hold(), finished = deferred(), release = deferred()
+    const refresh = h.store.getState().refreshMessages
+    let first = true
+    // Keep the real refresh action; pause its result delivery to retry after
+    // refresh has already applied A's success/error while A is still current.
+    h.store.setState({ refreshMessages: async () => {
+      const hold = first
+      first = false
+      try { return await refresh() }
+      finally { if (hold) { finished.resolve(); await release.promise } }
+    } })
+    const work = h.store.getState().retry()
+    await pending.dispatched.promise
+    if (completion === "error") pending.completion.reject(new Error("current A refresh failed"))
+    else pending.completion.resolve(history())
+    await finished.promise
+    await switchToB(h)
+    h.store.getState().disconnectSocket()
+    const before = stateSnapshot(h), socketCount = h.sockets.length
+    release.resolve()
+    await work
+    assert.deepEqual(stateSnapshot(h), before, "retry's own continuation must preserve B")
+    assert.equal(h.sockets.length, socketCount, "obsolete retry cannot reopen B's socket")
+  })
+}
+
+for (const type of ["customer_session.refresh", "message.created", "resyncRequired", "conversation.updated"]) {
+  test(type === "customer_session.refresh" ? "stale socket refresh cannot replace current session" : `stale socket ${type} cannot mutate the new customer`, async () => {
+    const h = await actionHarness(), socket = h.store.getState().socket
+    h.deferRealtime()
+    // A queued message deliberately names B's conversation: socket identity is
+    // authoritative even if an envelope appears to match the current store.
+    const data = type === "customer_session.refresh"
+      ? { customerSessionToken: "synthetic-old-socket", expiresAt: "2026-10-07T03:00:00Z" }
+      : type === "message.created" ? { conversationId: 911, message: { ...message(911), content: "old socket marker" } }
+      : { conversationId: 911, status: 2 }
+    socket.emit("message", { data: JSON.stringify({ type, data }) })
+    assert.equal(h.realtimeDeliveries.length, 1)
+    await switchToB(h)
+    const before = stateSnapshot(h), stored = h.window.sessionStorage.getItem("cs_ai_agent_customer_session"), count = h.requests.length
+    h.realtimeDeliveries.shift()()
+    await h.flush()
+    assert.deepEqual(stateSnapshot(h), before)
+    assert.ok(h.window.sessionStorage.getItem("cs_ai_agent_customer_session") === stored, "B session storage survives old socket refresh")
+    assert.equal(h.requests.length, count, "old resync must not fetch B history")
+  })
+}
+
+test("stale socket status callbacks cannot mutate the new customer", async () => {
+  const h = await actionHarness(), socket = h.store.getState().socket
+  await switchToB(h)
+  const before = stateSnapshot(h), currentSocket = h.store.getState().socket
+  socket.emit("open"); socket.emit("error"); socket.emit("close")
+  assert.deepEqual(stateSnapshot(h), before)
+  assert.ok(h.store.getState().socket === currentSocket)
+})
+
+for (const completion of ["permission", "click"]) {
+  test(`stale notification ${completion} cannot expose the old customer`, async () => {
+    const h = await actionHarness()
+    h.document.visibilityState = "hidden"
+    if (completion === "click") h.Notification.permission = "granted"
+    h.store.getState().socket.emit("message", { data: JSON.stringify({ type: "message.created",
+      data: { conversationId: 901, message: { ...message(901), id: 950, senderType: "agent", content: "private A notification" } } }) })
+    await switchToB(h)
+    h.store.setState({ isOpen: false, isVisible: false })
+    const before = stateSnapshot(h)
+    if (completion === "permission") {
+      h.notificationPermission.resolve("granted")
+      await h.flush()
+      assert.equal(h.notifications.length, 0, "permission resolved for departed A must not create a notification")
+    } else {
+      assert.equal(h.notifications.length, 1)
+      h.notifications[0].onclick()
+      assert.equal(h.focusCount(), 0, "old notification cannot focus B")
+    }
+    assert.deepEqual(stateSnapshot(h), before)
+  })
+}
+
+for (const phase of ["pending", "accepted"]) {
+  test(`same-A callbacks captured before renewal remain valid while renewal is ${phase}`, async () => {
+    const renewal = deferred(), data = deferred()
+    let holdHistory = false
+    const h = await initializedA({ exchange: async () => renewal.promise, intercept: (path) => {
+      if (holdHistory && path.startsWith("/api/message/list")) { holdHistory = false; return data.promise }
+    } })
+    const oldScope = h.scope.captureCustomerSessionScope(), socket = h.store.getState().socket
+    holdHistory = true
+    const work = h.store.getState().refreshMessages()
+    const header = h.requests.at(-1).options.onResponse
+    h.deferRealtime()
+    socket.emit("message", { data: JSON.stringify({ type: "customer_session.refresh",
+      data: { customerSessionToken: "synthetic-renewal-socket", expiresAt: "2026-10-07T04:00:00Z" } }) })
+    writeSession(h, session({ expiresAt: "2026-10-07T01:00:03Z" }))
+    h.store.getState().bootstrap()
+    await h.flush()
+    if (phase === "accepted") {
+      renewal.resolve(session({ customerSessionToken: "synthetic-renewed" }))
+      await h.flush()
+    }
+    data.resolve(history("legitimate A history"))
+    await work
+    assert.equal(h.store.getState().messages[0].content, "legitimate A history")
+    header(refreshResponse())
+    assert.ok(h.im.readCustomerSession().customerSessionToken === "synthetic-late-refresh")
+    h.realtimeDeliveries.shift()()
+    assert.ok(h.im.readCustomerSession().customerSessionToken === "synthetic-renewal-socket")
+    assert.equal(h.scope.captureCustomerSessionScope().epoch, oldScope.epoch)
+    if (phase === "pending") { renewal.resolve(session()); await h.flush() }
+    // Reconnecting the same identity must also capture a usable socket scope.
+    socket.emit("close")
+    h.runTimers()
+    const reconnected = h.store.getState().socket
+    assert.ok(reconnected && reconnected !== socket)
+    reconnected.emit("message", { data: JSON.stringify({ type: "customer_session.refresh",
+      data: { customerSessionToken: "synthetic-reconnected", expiresAt: "2026-10-07T04:00:00Z" } }) })
+    h.realtimeDeliveries.shift()()
+    assert.ok(h.im.readCustomerSession().customerSessionToken === "synthetic-reconnected")
+  })
+}
+
+for (const proof of ["expired", "missing"]) {
+  test(`${proof} departure rejects captured A callbacks before fresh response and after failure`, async () => {
+    const renewal = deferred(), pending = [deferred(), deferred()]
+    let historyIndex = 0, holdHistory = false
+    const h = await initializedA({ exchange: async () => renewal.promise, intercept: (path) => {
+      if (holdHistory && path.startsWith("/api/message/list")) return pending[historyIndex++].promise
+    } })
+    holdHistory = true
+    const works = [h.store.getState().refreshMessages(), h.store.getState().syncLatestMessages()]
+    const headers = h.requests.slice(-2).map((item) => item.options.onResponse)
+    h.deferRealtime()
+    for (let i = 0; i < 2; i++) h.store.getState().socket.emit("message", { data: JSON.stringify({ type: "customer_session.refresh",
+      data: { customerSessionToken: "synthetic-departed", expiresAt: "2026-10-07T04:00:00Z" } }) })
+    writeSession(h, proof === "missing" ? null : session({ expiresAt: "2026-10-07T01:00:00Z" }))
+    h.store.getState().bootstrap()
+    await h.flush()
+    const observations = []
+    for (let i = 0; i < 2; i++) {
+      if (i === 1) { renewal.reject(new Error("fresh exchange failed")); await h.flush() }
+      const before = stateSnapshot(h)
+      pending[i].resolve(history())
+      await works[i]
+      headers[i](refreshResponse())
+      h.realtimeDeliveries.shift()()
+      observations.push({ before, after: stateSnapshot(h), sessionAbsent: h.im.readCustomerSession() === null })
+    }
+    for (const observation of observations) {
+      assert.deepEqual(observation.after, observation.before)
+      assert.equal(observation.sessionAbsent, true)
+    }
+  })
+}
+
+for (const completion of ["success", "error"]) {
+  test(`older bootstrap cannot overwrite the winner (${completion})`, async () => {
+    const older = deferred(), newer = deferred()
+    let count = 0
+    const h = await initializedA({ exchange: async () => (++count === 1 ? older.promise : newer.promise) })
+    writeSession(h, session({ expiresAt: "2026-10-07T01:00:03Z" }))
+    h.store.getState().bootstrap(); await h.flush()
+    h.store.getState().bootstrap(); await h.flush()
+    newer.resolve(session({ customer: { id: 202, name: "B" } })); await h.flush()
+    const before = stateSnapshot(h), stored = h.window.sessionStorage.getItem("cs_ai_agent_customer_session")
+    if (completion === "error") older.reject(new Error("older bootstrap failed"))
+    else older.resolve(session())
+    await h.flush()
+    assert.deepEqual(stateSnapshot(h), before)
+    assert.ok(h.window.sessionStorage.getItem("cs_ai_agent_customer_session") === stored)
+  })
+}
+
+async function initializedA({ exchange = async () => session(), widget = async () => presentation, match = async (id) => conversation(id), intercept = () => undefined } = {}) {
   let matchCount = 0
   const runtime = { channelId: "channel-C", externalId: "hint-X" }
   const harness = await loadSupportChatHarness({
     config: runtime, session: session(), now, scopeControl: "normal",
     request: async (path, options) => {
+      const intercepted = intercept(path, options)
+      if (intercepted !== undefined) return intercepted
       if (path.startsWith("/api/channel/config")) return widget(path, options)
       if (path === "/api/customer/session_exchange") return exchange(path, options)
       if (path === "/api/conversation/create_or_match") return match(++matchCount === 1 ? 901 : 911)

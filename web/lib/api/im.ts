@@ -8,7 +8,9 @@ import {
   captureCustomerSessionScope,
   invalidateCustomerSessionScope,
   isCustomerSessionAttemptCurrent,
+  isCustomerSessionScopeCurrent,
   type CustomerSessionAttempt,
+  type CustomerSessionScope,
 } from "@/lib/api/im-session-scope"
 
 export type Paging = {
@@ -247,17 +249,20 @@ export function getCustomerSessionToken() {
     : ""
 }
 
-export function applyCustomerSessionRefresh(payload?: {
+export function applyCustomerSessionRefresh(payload: {
   customerSessionToken?: string
   expiresAt?: string
-}) {
+} | undefined, scope: CustomerSessionScope | null): void {
+  if (!isCustomerSessionScopeCurrent(scope)) {
+    return
+  }
   const token = payload?.customerSessionToken?.trim()
   const expiresAt = payload?.expiresAt?.trim()
   if (!token || !expiresAt) {
     return
   }
   const current = readCustomerSession()
-  if (!current) {
+  if (!current || current.customer.id !== scope?.customerId || current.channelId !== scope.channelId) {
     return
   }
   writeCustomerSession({
@@ -267,11 +272,11 @@ export function applyCustomerSessionRefresh(payload?: {
   })
 }
 
-function applyCustomerSessionHeaders(response: Response) {
+function applyCustomerSessionHeaders(response: Response, scope: CustomerSessionScope | null): void {
   applyCustomerSessionRefresh({
     customerSessionToken: response.headers.get(CUSTOMER_SESSION_TOKEN_HEADER) ?? "",
     expiresAt: response.headers.get(CUSTOMER_SESSION_EXPIRES_HEADER) ?? "",
-  })
+  }, scope)
 }
 
 function createChannelHeaders() {
@@ -387,6 +392,7 @@ function createRequestOptions(
   skipAuth?: boolean
   onResponse?: (response: Response) => void
 } {
+  const scope = captureCustomerSessionScope()
   return {
     ...init,
     skipAuth: true,
@@ -394,7 +400,7 @@ function createRequestOptions(
       ...createImHeaders(),
       ...(init?.headers as Record<string, string> | undefined),
     },
-    onResponse: applyCustomerSessionHeaders,
+    onResponse: (response) => applyCustomerSessionHeaders(response, scope),
     baseUrl: getRuntimeImConfig().baseUrl,
   }
 }

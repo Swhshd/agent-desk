@@ -29,6 +29,9 @@ async function loadHarness({ config, session, request, now, scopeControl }, with
     throw new Error("Choose an explicit harness scope control")
   }
   const requests = [], sockets = [], timers = new Map(), modules = new Map()
+  const realtimeDeliveries = [], notifications = []
+  const notificationPermission = deferred()
+  let deferRealtime = false, focusCount = 0
   let timerId = 0, uuidId = 0, runtimeConfig = config
   const window = {
     localStorage: memoryStorage(), sessionStorage: memoryStorage(),
@@ -37,7 +40,7 @@ async function loadHarness({ config, session, request, now, scopeControl }, with
     clearTimeout: (id) => timers.delete(id),
     setInterval: (callback) => { timers.set(++timerId, callback); return timerId },
     clearInterval: (id) => timers.delete(id),
-    focus() {},
+    focus() { focusCount += 1 },
   }
   window.self = window.top = window
   if (session !== null) {
@@ -69,6 +72,14 @@ async function loadHarness({ config, session, request, now, scopeControl }, with
     send(value) { this.sent.push(value) }
     close() { this.closed = true; this.readyState = FakeSocket.CLOSED; this.emit("close") }
   }
+  class FakeNotification {
+    static permission = "default"
+    static requestPermission() { return notificationPermission.promise }
+    constructor(title, options) { this.title = title; this.options = options; notifications.push(this) }
+    close() { this.closed = true }
+  }
+  window.Notification = FakeNotification
+  const document = { visibilityState: "visible" }
   const stubs = {
     "@/lib/api/client": { request: async (apiPath, options) => {
       requests.push({ path: apiPath, options })
@@ -82,7 +93,7 @@ async function loadHarness({ config, session, request, now, scopeControl }, with
     },
   }
   const context = vm.createContext({
-    window, document: { visibilityState: "visible" }, Date: FixedDate,
+    window, document, Notification: FakeNotification, Date: FixedDate,
     WebSocket: FakeSocket, URLSearchParams, URL, FormData, Headers, Response,
     console, process: { env: {} },
     setTimeout: window.setTimeout, clearTimeout: window.clearTimeout,
@@ -107,6 +118,23 @@ async function loadHarness({ config, session, request, now, scopeControl }, with
     }
     new vm.Script(`(function(require,module,exports){${compiled}\n})`, { filename })
       .runInContext(context)(localRequire, module, module.exports)
+    // Hold delivery after the real manager accepts a socket event, so the store
+    // must still reject a queued callback after identity departure/disconnect.
+    if (filename.endsWith("realtime-connection.ts")) {
+      const createManager = module.exports.createRealtimeConnectionManager
+      module.exports.createRealtimeConnectionManager = (options) => createManager({
+        ...options,
+        onMessage: (event, socket) => {
+          const deliver = () => options.onMessage?.(event, socket)
+          if (deferRealtime) realtimeDeliveries.push(deliver)
+          else deliver()
+        },
+      })
+    }
+    if (scopeControl === "normal" && process.env.CUSTOMER_SESSION_SCOPE_CONTROL === "always-current" && filename.endsWith("im-session-scope.ts")) {
+      // Test-only sensitivity mutation; attempt generation remains real.
+      module.exports.isCustomerSessionScopeCurrent = () => true
+    }
     if (scopeControl === "bypass" && filename.endsWith("im-session-scope.ts")) {
       module.exports.isCustomerSessionScopeCurrent = () => true
       module.exports.isCustomerSessionAttemptCurrent = () => true
@@ -114,7 +142,11 @@ async function loadHarness({ config, session, request, now, scopeControl }, with
     return module.exports
   }
   const im = loadModule(path.join(webRoot, "lib/api/im.ts"))
-  const result = { im, window, requests }
+  const result = { im, window, requests, document, notifications, notificationPermission,
+    Notification: FakeNotification, realtimeDeliveries,
+    deferRealtime: () => { deferRealtime = true }, focusCount: () => focusCount,
+    runTimers: () => { const callbacks = [...timers.values()]; timers.clear(); callbacks.forEach((callback) => callback()) },
+  }
   // Expose the actual shared scope module through the same VM/cache as API and store.
   const scopePath = path.join(webRoot, "lib/api/im-session-scope.ts")
   if (existsSync(scopePath)) result.scope = loadModule(scopePath)

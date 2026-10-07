@@ -20,6 +20,71 @@ const selectHeaders = process.env.CUSTOMER_SESSION_HEADER_CONTROL === "remove-pr
   ? (headers) => Object.fromEntries(Object.entries(headers).filter(([key]) => key !== "X-Customer-Session-Token"))
   : (headers) => headers
 
+const refreshed = (token) => new Response(null, { headers: {
+  "X-Customer-Session-Token": token, "X-Customer-Session-Expires-At": "2026-10-07T03:00:00Z",
+} })
+
+test("stale REST refresh cannot replace current session", async () => {
+  const pending = deferred()
+  const h = await loadImHarness(options({ request: async (path) => path === "/api/customer/session_exchange"
+    ? response({ customer: { id: 202, name: "B" }, customerSessionToken: "synthetic-proof-B" }) : pending.promise }))
+  await h.im.ensureCustomerSession()
+  const work = h.im.fetchImMessages({ conversationId: 901 })
+  const onResponse = h.requests.at(-1).options.onResponse
+  await h.im.exchangeCustomerSession()
+  const stored = h.window.sessionStorage.getItem("cs_ai_agent_customer_session")
+  onResponse(refreshed("synthetic-old-rest"))
+  pending.resolve({ results: [] })
+  await work
+  assert.ok(h.window.sessionStorage.getItem("cs_ai_agent_customer_session") === stored, "stale A response must preserve B storage")
+})
+
+test("same customer concurrent refresh retains the epoch", async () => {
+  const pending = [deferred(), deferred()]
+  let index = 0
+  const h = await loadImHarness(options({ request: async () => pending[index++].promise }))
+  await h.im.ensureCustomerSession()
+  const scope = h.scope.captureCustomerSessionScope()
+  const works = [h.im.fetchImMessages({ conversationId: 901 }), h.im.fetchImMessages({ conversationId: 901 })]
+  h.im.beginCustomerSessionBootstrap()
+  for (let i = 0; i < 2; i++) {
+    h.requests[i].options.onResponse(refreshed(`synthetic-concurrent-${i}`))
+    pending[i].resolve({ results: [] })
+    await works[i]
+    assert.ok(h.im.readCustomerSession().customerSessionToken === `synthetic-concurrent-${i}`, "same-A refresh survives other token and attempt changes")
+    assert.equal(h.scope.captureCustomerSessionScope().epoch, scope.epoch)
+  }
+})
+
+test("stale REST refresh cannot replace current session after identity departure and reactivation", async () => {
+  const pending = deferred()
+  const h = await loadImHarness(options({ request: async (path) => path === "/api/customer/session_exchange"
+    ? response({ customerSessionToken: "synthetic-reactivated" }) : pending.promise }))
+  await h.im.ensureCustomerSession()
+  const oldScope = h.scope.captureCustomerSessionScope()
+  const work = h.im.fetchImMessages({ conversationId: 901 }), callback = h.requests.at(-1).options.onResponse
+  h.im.departCustomerSessionIdentity()
+  await h.im.exchangeCustomerSession()
+  assert.notEqual(h.scope.captureCustomerSessionScope().epoch, oldScope.epoch)
+  const stored = h.window.sessionStorage.getItem("cs_ai_agent_customer_session")
+  callback(refreshed("synthetic-departed-rest"))
+  pending.resolve({ results: [] }); await work
+  assert.ok(h.window.sessionStorage.getItem("cs_ai_agent_customer_session") === stored, "departed epoch cannot refresh even a reactivated customer id")
+})
+
+test("channel replacement invalidates captured REST refresh scope", async () => {
+  const pending = deferred(), runtime = config()
+  const h = await loadImHarness(options({ config: runtime, request: async (path) => path === "/api/customer/session_exchange" ? response() : pending.promise }))
+  await h.im.ensureCustomerSession()
+  const work = h.im.fetchImMessages({ conversationId: 901 }), callback = h.requests.at(-1).options.onResponse
+  runtime.channelId = "channel-D"
+  await h.im.exchangeCustomerSession()
+  const stored = h.window.sessionStorage.getItem("cs_ai_agent_customer_session")
+  callback(refreshed("synthetic-old-channel"))
+  pending.resolve({ results: [] }); await work
+  assert.ok(h.window.sessionStorage.getItem("cs_ai_agent_customer_session") === stored)
+})
+
 test("cached guest session avoids exchange", async () => {
   const { im, requests } = await loadImHarness(options())
   const result = await im.ensureCustomerSession()
