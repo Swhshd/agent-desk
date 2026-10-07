@@ -31,6 +31,66 @@ func TestEmployeeTimerCloseClearsReference(t *testing.T) {
 	}
 }
 
+func TestEmployeeLifecycleWiringValidation(t *testing.T) {
+	oldManager, oldLifecycle, oldWS := employeeWSManager, employeeRealtime, WsService
+	oldLogin, oldUser, oldRole, oldPermission := LoginSessionService, UserService, RoleService, PermissionService
+	oldOIDC, oldUserPermission := OIDCLoginService, UserPermissionService
+	t.Cleanup(func() {
+		employeeWSManager, employeeRealtime, WsService = oldManager, oldLifecycle, oldWS
+		LoginSessionService, UserService, RoleService, PermissionService = oldLogin, oldUser, oldRole, oldPermission
+		OIDCLoginService, UserPermissionService = oldOIDC, oldUserPermission
+	})
+	manager := newWsConnectionManager()
+	lifecycle := newEmployeeRealtimeLifecycle(manager, employeeAuthStateReader{})
+	spy := &employeeRealtimeInvalidationSpy{}
+	employeeWSManager, employeeRealtime = manager, lifecycle
+	WsService = newWsService(manager, lifecycle)
+	LoginSessionService = newLoginSessionService(lifecycle)
+	UserService = newUserService(lifecycle)
+	RoleService = newRoleService(lifecycle)
+	PermissionService = newPermissionService(lifecycle)
+	OIDCLoginService = newOIDCLoginService(lifecycle)
+	UserPermissionService = newUserPermissionService(lifecycle)
+	if err := ValidateEmployeeRealtimeLifecycleWiring(); err != nil {
+		t.Fatalf("complete lifecycle wiring rejected: %v", err)
+	}
+	cases := []struct {
+		name        string
+		breakWiring func()
+	}{
+		{"dashboard websocket service missing", func() { WsService = nil }},
+		{"dashboard websocket manager mismatch", func() { WsService.manager = newWsConnectionManager() }},
+		{"dashboard lifecycle mismatch", func() {
+			WsService.lifecycle = newEmployeeRealtimeLifecycle(newWsConnectionManager(), employeeAuthStateReader{})
+		}},
+		{"login-session invalidator missing", func() { LoginSessionService.invalidator = nil }},
+		{"login-session invalidator mismatch", func() { LoginSessionService.invalidator = spy }},
+		{"user invalidator missing", func() { UserService.invalidator = nil }},
+		{"user invalidator mismatch", func() { UserService.invalidator = spy }},
+		{"role invalidator missing", func() { RoleService.invalidator = nil }},
+		{"role invalidator mismatch", func() { RoleService.invalidator = spy }},
+		{"permission invalidator missing", func() { PermissionService.invalidator = nil }},
+		{"permission invalidator mismatch", func() { PermissionService.invalidator = spy }},
+		{"OIDC invalidator missing", func() { OIDCLoginService.invalidator = nil }},
+		{"OIDC invalidator mismatch", func() { OIDCLoginService.invalidator = spy }},
+		{"user-permission invalidator missing", func() { UserPermissionService.invalidator = nil }},
+		{"user-permission invalidator mismatch", func() { UserPermissionService.invalidator = spy }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Restore the coherent graph between cases without using production globals as fallbacks.
+			WsService = newWsService(manager, lifecycle)
+			LoginSessionService, UserService = newLoginSessionService(lifecycle), newUserService(lifecycle)
+			RoleService, PermissionService = newRoleService(lifecycle), newPermissionService(lifecycle)
+			OIDCLoginService, UserPermissionService = newOIDCLoginService(lifecycle), newUserPermissionService(lifecycle)
+			tc.breakWiring()
+			if err := ValidateEmployeeRealtimeLifecycleWiring(); err == nil {
+				t.Fatal("invalid lifecycle wiring accepted")
+			}
+		})
+	}
+}
+
 // Each test catches lost timer ownership or an unauthorized lifecycle transition.
 func lifecycleTestSession(t *testing.T, m *WsConnectionManager, id string, employeeID, loginID int64, active bool) *ClientSession {
 	t.Helper()

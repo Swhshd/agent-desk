@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,11 +10,12 @@ import (
 	"agent-desk/internal/pkg/config"
 	"agent-desk/internal/pkg/constants"
 	"agent-desk/internal/pkg/enums"
+	"gorm.io/gorm"
 )
 
 func TestOIDCLoginAutoCreatesSystemUser(t *testing.T) {
 	db := setupAuthServiceTestDB(t)
-	svc := newOIDCLoginService()
+	svc := newOIDCLoginService(&employeeRealtimeInvalidationSpy{})
 
 	ret, err := svc.loginWithOIDCProfile(&oidcLoginProfile{
 		Subject:           "sub-123",
@@ -61,6 +63,38 @@ func TestOIDCLoginAutoCreatesSystemUser(t *testing.T) {
 	}
 }
 
+func TestEmployeeOIDCDefaultRoleCommitRollback(t *testing.T) {
+	db := setupAuthServiceTestDB(t)
+	if err := db.Create(&models.Role{Code: constants.RoleCodeCsUser, Name: "Support Agent", Status: enums.StatusOk}).Error; err != nil {
+		t.Fatal(err)
+	}
+	spy := &employeeRealtimeInvalidationSpy{}
+	failure := errors.New("injected OIDC token persistence failure")
+	const name = "test:oidc_session_create_failure"
+	if err := db.Callback().Create().Before("gorm:create").Register(name, func(tx *gorm.DB) {
+		if tx.Statement.Table == "t_login_session" {
+			tx.AddError(failure)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Callback().Create().Remove(name)
+	_, err := newOIDCLoginService(spy).loginWithOIDCProfile(&oidcLoginProfile{Subject: "oidc-rollback", PreferredUsername: "oidc-rollback", RawProfile: `{}`}, config.AuthConfig{TokenTTLHours: 1}, "127.0.0.1", "test")
+	if !errors.Is(err, failure) {
+		t.Fatalf("OIDC transaction error = %v", err)
+	}
+	var users, memberships int64
+	if err := db.Model(&models.User{}).Count(&users).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.UserRole{}).Count(&memberships).Error; err != nil {
+		t.Fatal(err)
+	}
+	if users != 0 || memberships != 0 || len(spy.ids) != 0 {
+		t.Fatalf("OIDC rollback persisted or invalidated: users=%d memberships=%d invalidations=%v", users, memberships, spy.ids)
+	}
+}
+
 func TestOIDCLoginReusesExistingIdentity(t *testing.T) {
 	db := setupAuthServiceTestDB(t)
 	user := createAuthTestUser(t, db, "existing", "secret")
@@ -74,7 +108,7 @@ func TestOIDCLoginReusesExistingIdentity(t *testing.T) {
 		t.Fatalf("seed OIDC identity: %v", err)
 	}
 
-	ret, err := newOIDCLoginService().loginWithOIDCProfile(&oidcLoginProfile{
+	ret, err := newOIDCLoginService(&employeeRealtimeInvalidationSpy{}).loginWithOIDCProfile(&oidcLoginProfile{
 		Subject:           "sub-123",
 		PreferredUsername: "ignored",
 		Name:              "Updated Name",
@@ -122,7 +156,8 @@ func TestOIDCLoginFirstUserGetsLowestStaffRole(t *testing.T) {
 		}
 	}
 
-	if _, err := newOIDCLoginService().loginWithOIDCProfile(&oidcLoginProfile{
+	spy := &employeeRealtimeInvalidationSpy{}
+	if _, err := newOIDCLoginService(spy).loginWithOIDCProfile(&oidcLoginProfile{
 		Subject:           "sub-777",
 		Email:             "stranger@example.com",
 		PreferredUsername: "stranger",
@@ -149,5 +184,14 @@ func TestOIDCLoginFirstUserGetsLowestStaffRole(t *testing.T) {
 	}
 	if roles[0].Code != constants.RoleCodeCsUser {
 		t.Fatalf("first-time OIDC user role = %q, want %q", roles[0].Code, constants.RoleCodeCsUser)
+	}
+	if len(spy.ids) != 1 || spy.ids[0] != user.ID {
+		t.Fatalf("default role insertion invalidations = %v", spy.ids)
+	}
+	if _, err := newOIDCLoginService(spy).loginWithOIDCProfile(&oidcLoginProfile{Subject: "sub-777", PreferredUsername: "stranger", RawProfile: `{}`}, config.AuthConfig{TokenTTLHours: 2}, "127.0.0.1", "go-test"); err != nil {
+		t.Fatalf("existing-role OIDC login failed: %v", err)
+	}
+	if len(spy.ids) != 1 {
+		t.Fatalf("existing default role caused another invalidation: %v", spy.ids)
 	}
 }

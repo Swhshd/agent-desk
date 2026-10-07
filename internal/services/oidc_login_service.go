@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -21,15 +22,16 @@ import (
 	"gorm.io/gorm"
 )
 
-var OIDCLoginService = newOIDCLoginService()
+var OIDCLoginService = newOIDCLoginService(employeeRealtime)
 
 type oidcLoginService struct {
+	invalidator EmployeeRealtimeInvalidator
 }
 
 type oidcLoginProfile = oidcclient.Profile
 
-func newOIDCLoginService() *oidcLoginService {
-	return &oidcLoginService{}
+func newOIDCLoginService(invalidator EmployeeRealtimeInvalidator) *oidcLoginService {
+	return &oidcLoginService{invalidator: invalidator}
 }
 
 func (s *oidcLoginService) BuildOIDCLoginURL(next string) (string, error) {
@@ -110,7 +112,9 @@ func (s *oidcLoginService) loginWithOIDCProfile(profile *oidcLoginProfile, authC
 			return err
 		}
 
-		s.ensureDefaultOIDCRole(ctx.Tx, user)
+		if _, err := s.ensureDefaultOIDCRole(ctx, user); err != nil {
+			return err
+		}
 		s.syncOIDCUserOrganizations(ctx.Tx, user, profile)
 
 		if err = repositories.UserIdentityRepository.Updates(ctx.Tx, identity.ID, map[string]any{
@@ -182,7 +186,6 @@ func (s *oidcLoginService) createOIDCUser(ctx *sqls.TxContext, profile *oidcLogi
 	if err := repositories.UserIdentityRepository.Create(ctx.Tx, identity); err != nil {
 		return nil, nil, err
 	}
-	s.ensureDefaultOIDCRole(ctx.Tx, user)
 	return user, identity, nil
 }
 
@@ -261,20 +264,28 @@ func shortSubjectHash(subject string) string {
 // The provider vouches for who the user is, not what they may administer, so
 // a user arriving without any role must never escalate to an administrative
 // one.
-func (s *oidcLoginService) ensureDefaultOIDCRole(tx *gorm.DB, user *models.User) {
+func (s *oidcLoginService) ensureDefaultOIDCRole(ctx *sqls.TxContext, user *models.User) (bool, error) {
 	if user == nil || user.ID <= 0 {
-		return
+		return false, nil
 	}
-	existingRole := repositories.UserRoleRepository.FindOne(tx, sqls.NewCnd().Eq("user_id", user.ID))
-	if existingRole != nil {
-		return
+	var existingRole models.UserRole
+	err := ctx.Tx.Where("user_id = ?", user.ID).First(&existingRole).Error
+	if err == nil {
+		return false, nil
 	}
-	defaultRole := repositories.RoleRepository.GetByCode(tx, constants.RoleCodeCsUser)
-	if defaultRole == nil {
-		return
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, err
+	}
+	var defaultRole models.Role
+	err = ctx.Tx.Where("code = ?", constants.RoleCodeCsUser).First(&defaultRole).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
 	}
 	now := time.Now()
-	_ = repositories.UserRoleRepository.Create(tx, &models.UserRole{
+	if err := repositories.UserRoleRepository.Create(ctx.Tx, &models.UserRole{
 		UserID: user.ID,
 		RoleID: defaultRole.ID,
 		AuditFields: models.AuditFields{
@@ -285,7 +296,14 @@ func (s *oidcLoginService) ensureDefaultOIDCRole(tx *gorm.DB, user *models.User)
 			UpdateUserID:   user.ID,
 			UpdateUserName: user.Username,
 		},
-	})
+	}); err != nil {
+		return false, err
+	}
+	if s.invalidator == nil {
+		panic("employee realtime invalidator is required")
+	}
+	ctx.RegisterCallback(func() { s.invalidator.InvalidateEmployees([]int64{user.ID}) })
+	return true, nil
 }
 
 func (s *oidcLoginService) syncOIDCUserOrganizations(tx *gorm.DB, user *models.User, profile *oidcLoginProfile) {

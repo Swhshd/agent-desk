@@ -6,21 +6,25 @@ import (
 	"agent-desk/internal/pkg/dto/response"
 	"agent-desk/internal/pkg/enums"
 	"agent-desk/internal/repositories"
+	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"agent-desk/internal/pkg/httpx/params"
 
 	"github.com/mlogclub/simple/sqls"
+	"gorm.io/gorm"
 )
 
-var PermissionService = newPermissionService()
+var PermissionService = newPermissionService(employeeRealtime)
 
-func newPermissionService() *permissionService {
-	return &permissionService{}
+func newPermissionService(invalidator EmployeeRealtimeInvalidator) *permissionService {
+	return &permissionService{invalidator: invalidator}
 }
 
 type permissionService struct {
+	invalidator EmployeeRealtimeInvalidator
 }
 
 func (s *permissionService) Get(id int64) *models.Permission {
@@ -75,22 +79,31 @@ func (s *permissionService) SyncBuiltinPermissions() (*response.PermissionSyncRe
 	result := &response.PermissionSyncResponse{}
 	err := sqls.WithTransaction(func(ctx *sqls.TxContext) error {
 		permissions := make(map[string]*models.Permission, len(constants.Permissions))
+		changedPermissionIDs := make([]int64, 0)
+		changedRoleIDs := make([]int64, 0)
 		now := time.Now()
 
 		for _, spec := range constants.Permissions {
-			permission := repositories.PermissionRepository.FindOne(ctx.Tx, sqls.NewCnd().Eq("code", spec.Code))
-			if permission == nil {
-				permission = &models.Permission{
+			var permission models.Permission
+			lookupErr := ctx.Tx.Where("code = ?", spec.Code).First(&permission).Error
+			if errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+				permission = models.Permission{
 					Name: spec.Name, Code: spec.Code, Type: spec.Type, GroupName: spec.GroupName,
 					Method: spec.Method, APIPath: spec.APIPath, SortNo: spec.SortNo,
 					Status: enums.StatusOk, IsBuiltin: true,
 					AuditFields: systemPermissionAuditFields(now),
 				}
-				if err := repositories.PermissionRepository.Create(ctx.Tx, permission); err != nil {
+				if err := repositories.PermissionRepository.Create(ctx.Tx, &permission); err != nil {
 					return err
 				}
 				result.Created++
 			} else {
+				if lookupErr != nil {
+					return lookupErr
+				}
+				if permission.Status != enums.StatusOk {
+					changedPermissionIDs = append(changedPermissionIDs, permission.ID)
+				}
 				if err := repositories.PermissionRepository.Updates(ctx.Tx, permission.ID, map[string]any{
 					"name": spec.Name, "type": spec.Type, "group_name": spec.GroupName,
 					"method": spec.Method, "api_path": spec.APIPath, "sort_no": spec.SortNo,
@@ -100,24 +113,34 @@ func (s *permissionService) SyncBuiltinPermissions() (*response.PermissionSyncRe
 				}); err != nil {
 					return err
 				}
-				permission = repositories.PermissionRepository.Get(ctx.Tx, permission.ID)
+				if err := ctx.Tx.First(&permission, permission.ID).Error; err != nil {
+					return err
+				}
 				result.Updated++
 			}
-			permissions[spec.Code] = permission
+			permissions[spec.Code] = &permission
 		}
 
 		for roleCode, specs := range constants.RolePermissions {
-			role := repositories.RoleRepository.GetByCode(ctx.Tx, roleCode)
-			if role == nil {
-				return fmt.Errorf("builtin role not found: %s", roleCode)
+			var role models.Role
+			if err := ctx.Tx.Where("code = ?", roleCode).First(&role).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("builtin role not found: %s", roleCode)
+				}
+				return err
 			}
 			for _, spec := range specs {
 				permission := permissions[spec.Code]
 				if permission == nil {
 					return fmt.Errorf("builtin permission not found: %s", spec.Code)
 				}
-				if repositories.RolePermissionRepository.FindOne(ctx.Tx, sqls.NewCnd().Eq("role_id", role.ID).Eq("permission_id", permission.ID)) != nil {
+				var relation models.RolePermission
+				lookupErr := ctx.Tx.Where("role_id = ? AND permission_id = ?", role.ID, permission.ID).First(&relation).Error
+				if lookupErr == nil {
 					continue
+				}
+				if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+					return lookupErr
 				}
 				if err := repositories.RolePermissionRepository.Create(ctx.Tx, &models.RolePermission{
 					RoleID: role.ID, PermissionID: permission.ID,
@@ -125,8 +148,18 @@ func (s *permissionService) SyncBuiltinPermissions() (*response.PermissionSyncRe
 				}); err != nil {
 					return err
 				}
+				changedRoleIDs = append(changedRoleIDs, role.ID)
 				result.RolePermissionsAdded++
 			}
+		}
+		if len(changedPermissionIDs)+len(changedRoleIDs) > 0 {
+			slices.Sort(changedPermissionIDs)
+			changedPermissionIDs = slices.Compact(changedPermissionIDs)
+			slices.Sort(changedRoleIDs)
+			changedRoleIDs = slices.Compact(changedRoleIDs)
+			ctx.RegisterCallback(func() {
+				invalidateCommittedEmployeeAuthzImpact(s.invalidator, employeeAuthzImpact{RoleIDs: changedRoleIDs, PermissionIDs: changedPermissionIDs}, "builtin permission sync")
+			})
 		}
 		return nil
 	})

@@ -26,6 +26,14 @@ func (r *userPermissionRepository) Get(db *gorm.DB, id int64) *models.UserPermis
 	return ret
 }
 
+func (r *userPermissionRepository) GetChecked(db *gorm.DB, id int64) (*models.UserPermission, error) {
+	var row models.UserPermission
+	if err := db.First(&row, "id = ?", id).Error; err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
 func (r *userPermissionRepository) Take(db *gorm.DB, where ...interface{}) *models.UserPermission {
 	ret := &models.UserPermission{}
 	if err := db.Take(ret, where...).Error; err != nil {
@@ -97,6 +105,6 @@ func (r *userPermissionRepository) UpdateColumn(db *gorm.DB, id int64, name stri
 	return
 }
 
-func (r *userPermissionRepository) Delete(db *gorm.DB, id int64) {
-	db.Delete(&models.UserPermission{}, "id = ?", id)
+func (r *userPermissionRepository) Delete(db *gorm.DB, id int64) error {
+	return db.Delete(&models.UserPermission{}, "id = ?", id).Error
 }

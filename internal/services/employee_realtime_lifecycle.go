@@ -1,9 +1,15 @@
 package services
 
 import (
+	"errors"
+	"log/slog"
+	"slices"
 	"time"
 
 	"agent-desk/internal/pkg/dto"
+	"agent-desk/internal/repositories"
+	"github.com/mlogclub/simple/sqls"
+	"gorm.io/gorm"
 )
 
 type EmployeeSessionSnapshot struct {
@@ -32,6 +38,86 @@ type employeeRealtimeLifecycle struct {
 	reader    employeeAuthStateReader
 	now       func() time.Time
 	afterFunc func(time.Duration, func()) *time.Timer
+}
+
+// ValidateEmployeeRealtimeLifecycleWiring prevents the server from exposing
+// authenticated routes when session mutations and WebSockets do not share the
+// same process-local lifecycle coordinator.
+func ValidateEmployeeRealtimeLifecycleWiring() error {
+	if employeeWSManager == nil || employeeRealtime == nil || WsService == nil {
+		return errors.New("employee realtime lifecycle wiring is incomplete")
+	}
+	if employeeRealtime.manager != employeeWSManager || WsService.manager != employeeWSManager || WsService.lifecycle != employeeRealtime {
+		return errors.New("employee realtime lifecycle wiring does not share the websocket manager")
+	}
+	if LoginSessionService == nil || LoginSessionService.invalidator != employeeRealtime ||
+		UserService == nil || UserService.invalidator != employeeRealtime ||
+		RoleService == nil || RoleService.invalidator != employeeRealtime ||
+		PermissionService == nil || PermissionService.invalidator != employeeRealtime ||
+		OIDCLoginService == nil || OIDCLoginService.invalidator != employeeRealtime ||
+		UserPermissionService == nil || UserPermissionService.invalidator != employeeRealtime {
+		return errors.New("employee authorization mutation services do not share the realtime lifecycle")
+	}
+	return nil
+}
+
+type employeeAuthzImpact struct {
+	RoleIDs       []int64
+	PermissionIDs []int64
+	EmployeeIDs   []int64
+}
+
+func CurrentRoleMemberIDs(db *gorm.DB, roleIDs []int64) ([]int64, error) {
+	return repositories.EmployeeAuthRepository.CurrentRoleMemberIDs(db, roleIDs)
+}
+
+func CurrentPermissionRoleIDs(db *gorm.DB, permissionIDs []int64) ([]int64, error) {
+	return repositories.EmployeeAuthRepository.CurrentPermissionRoleIDs(db, permissionIDs)
+}
+
+func CurrentDirectOverrideUserIDs(db *gorm.DB, permissionIDs []int64) ([]int64, error) {
+	return repositories.EmployeeAuthRepository.CurrentDirectOverrideUserIDs(db, permissionIDs)
+}
+
+func resolveEmployeeAuthzImpact(db *gorm.DB, impact employeeAuthzImpact) ([]int64, error) {
+	ids := append([]int64(nil), impact.EmployeeIDs...)
+	roleIDs := append([]int64(nil), impact.RoleIDs...)
+	if len(impact.PermissionIDs) > 0 {
+		permissionRoles, err := CurrentPermissionRoleIDs(db, impact.PermissionIDs)
+		if err != nil {
+			return nil, err
+		}
+		roleIDs = append(roleIDs, permissionRoles...)
+		owners, err := CurrentDirectOverrideUserIDs(db, impact.PermissionIDs)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, owners...)
+	}
+	if len(roleIDs) > 0 {
+		members, err := CurrentRoleMemberIDs(db, roleIDs)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, members...)
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids), nil
+}
+
+func invalidateCommittedEmployeeAuthzImpact(invalidator EmployeeRealtimeInvalidator, impact employeeAuthzImpact, mutation string) {
+	if invalidator == nil {
+		panic("employee realtime invalidator is required")
+	}
+	ids, err := resolveEmployeeAuthzImpact(sqls.DB(), impact)
+	if err != nil {
+		slog.Error("employee authorization impact resolution failed after commit", "mutation", mutation, "error", err)
+		invalidator.InvalidateAllEmployees()
+		return
+	}
+	if len(ids) > 0 {
+		invalidator.InvalidateEmployees(ids)
+	}
 }
 
 func newEmployeeRealtimeLifecycle(manager *WsConnectionManager, reader employeeAuthStateReader) *employeeRealtimeLifecycle {

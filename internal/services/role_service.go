@@ -9,6 +9,7 @@ import (
 	"agent-desk/internal/pkg/errorsx"
 	"agent-desk/internal/pkg/utils"
 	"agent-desk/internal/repositories"
+	"errors"
 	"slices"
 	"strings"
 	"time"
@@ -16,15 +17,17 @@ import (
 	"agent-desk/internal/pkg/httpx/params"
 
 	"github.com/mlogclub/simple/sqls"
+	"gorm.io/gorm"
 )
 
-var RoleService = newRoleService()
+var RoleService = newRoleService(employeeRealtime)
 
-func newRoleService() *roleService {
-	return &roleService{}
+func newRoleService(invalidator EmployeeRealtimeInvalidator) *roleService {
+	return &roleService{invalidator: invalidator}
 }
 
 type roleService struct {
+	invalidator EmployeeRealtimeInvalidator
 }
 
 func (s *roleService) Get(id int64) *models.Role {
@@ -165,6 +168,7 @@ func (s *roleService) UpdateStatus(id int64, status enums.Status, operator *dto.
 	}); err != nil {
 		return err
 	}
+	invalidateCommittedEmployeeAuthzImpact(s.invalidator, employeeAuthzImpact{RoleIDs: []int64{id}}, "role status update")
 	return nil
 }
 
@@ -186,9 +190,12 @@ func (s *roleService) replaceRolePermissions(roleID int64, permissionIDs []int64
 			return err
 		}
 		for _, permissionID := range permissionIDs {
-			permission := PermissionService.Get(permissionID)
-			if permission == nil {
-				return errorsx.InvalidParamI18n("error.e0236")
+			var permission models.Permission
+			if err := ctx.Tx.First(&permission, permissionID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errorsx.InvalidParamI18n("error.e0236")
+				}
+				return err
 			}
 			relation := &models.RolePermission{
 				RoleID:       roleID,
@@ -199,6 +206,9 @@ func (s *roleService) replaceRolePermissions(roleID int64, permissionIDs []int64
 				return err
 			}
 		}
+		ctx.RegisterCallback(func() {
+			invalidateCommittedEmployeeAuthzImpact(s.invalidator, employeeAuthzImpact{RoleIDs: []int64{roleID}}, "role permission replacement")
+		})
 		return nil
 	})
 }

@@ -55,6 +55,9 @@ func NewServer() (*gin.Engine, error) {
 	app.Use(maxBodySizeMiddleware())
 	app.Use(i18nx.Middleware())
 
+	if err := services.ValidateEmployeeRealtimeLifecycleWiring(); err != nil {
+		return nil, err
+	}
 	addRouter(app)
 
 	handleSpa(app)
