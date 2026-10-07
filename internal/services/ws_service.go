@@ -101,6 +101,16 @@ func (s *wsService) HandleOpenWS(ctx *gin.Context) {
 }
 
 func (s *wsService) upgradeConnection(ctx *gin.Context, principal *dto.AuthPrincipal, external *openidentity.ExternalUser, role string, customerSessionInfo ...*CustomerSessionVerifyResult) error {
+	var trusted *authenticatedEmployeeSession
+	employee := role == realtimeRoleAdmin || role == realtimeRoleNotification || (role == realtimeRoleUser && external == nil)
+	if employee {
+		var ok bool
+		trusted, ok = AuthService.GetAuthenticatedEmployeeSession(ctx)
+		if !ok || trusted.EmployeeID <= 0 || trusted.LoginSessionID <= 0 || trusted.Principal == nil || principal == nil || trusted.Principal.UserID != trusted.EmployeeID || principal.UserID != trusted.EmployeeID || s.lifecycle == nil {
+			ctx.AbortWithStatusJSON(http.StatusUnauthorized, web.JsonErrorCode(errorsx.CodeAuthUnauthorized, i18nx.T(ctx, "error.auth.expired")))
+			return fmt.Errorf("employee websocket requires trusted authentication metadata")
+		}
+	}
 	conn, err := s.upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
 		return err
@@ -118,6 +128,10 @@ func (s *wsService) upgradeConnection(ctx *gin.Context, principal *dto.AuthPrinc
 	}
 	if len(customerSessionInfo) > 0 && customerSessionInfo[0] != nil {
 		session.CustomerID = customerSessionInfo[0].CustomerID
+	}
+	if employee {
+		session.EmployeeID = trusted.EmployeeID
+		session.LoginSessionID = trusted.LoginSessionID
 	}
 	session.touch()
 
@@ -137,19 +151,41 @@ func (s *wsService) upgradeConnection(ctx *gin.Context, principal *dto.AuthPrinc
 		logExternalID = strings.TrimSpace(external.ExternalID)
 	}
 
-	sessionCount := s.manager.Register(session, s.defaultTopics(session))
+	var connectedTopics []string
+	if employee {
+		if !s.manager.RegisterPending(session) {
+			s.closeSession(session)
+			return fmt.Errorf("employee pending registration rejected")
+		}
+		snapshot, err := s.lifecycle.RevalidateEmployeeSession(session.LoginSessionID, time.Now())
+		if err != nil || snapshot.EmployeeID != session.EmployeeID || snapshot.LoginSessionID != session.LoginSessionID || snapshot.Principal == nil || snapshot.Principal.UserID != session.EmployeeID || !employeeLifecycleDeadline(snapshot).After(time.Now()) {
+			s.closeSession(session)
+			return fmt.Errorf("employee authoritative revalidation rejected")
+		}
+		if !s.lifecycle.InstallLifecycleTimer(session, employeeLifecycleDeadline(snapshot)) {
+			s.closeSession(session)
+			return fmt.Errorf("employee lifecycle timer rejected")
+		}
+		var activated bool
+		connectedTopics, activated = s.manager.Activate(session, snapshot, s.employeeDefaultTopics(session, snapshot))
+		if !activated {
+			s.closeSession(session)
+			return fmt.Errorf("employee activation rejected")
+		}
+	} else {
+		s.manager.Register(session, s.defaultTopics(session))
+		connectedTopics = session.topicList()
+	}
+	sessionCount := s.manager.Count()
 	slog.Info("realtime client connected",
 		"connId", session.ID,
 		"role", session.Role,
 		"userId", logUserID,
 		"externalId", logExternalID,
 		"terminalType", session.TerminalType,
-		"topicCount", len(session.Topics),
+		"topicCount", len(connectedTopics),
 		"sessionCount", sessionCount,
 	)
-
-	go s.writePump(session)
-	go s.readPump(session)
 
 	session.enqueueEvent(s.newEvent("", RealtimeConnectedEvent{
 		Payload: RealtimeConnectedPayload{
@@ -158,7 +194,7 @@ func (s *wsService) upgradeConnection(ctx *gin.Context, principal *dto.AuthPrinc
 			GuestID:      logExternalID,
 			Role:         role,
 			TerminalType: session.TerminalType,
-			Topics:       session.topicList(),
+			Topics:       connectedTopics,
 		},
 	}))
 	if len(customerSessionInfo) > 0 && customerSessionInfo[0] != nil && customerSessionInfo[0].Refreshed {
@@ -169,6 +205,16 @@ func (s *wsService) upgradeConnection(ctx *gin.Context, principal *dto.AuthPrinc
 			},
 		}))
 	}
+	// Terminal close uses this same lock. Pump creation must linearize before
+	// close, and connected/control enqueue must run outside the lock.
+	session.sendMu.Lock()
+	if session.Closed.Load() {
+		session.sendMu.Unlock()
+		return fmt.Errorf("websocket closed before pump startup")
+	}
+	go s.writePump(session)
+	go s.readPump(session)
+	session.sendMu.Unlock()
 	return nil
 }
 
@@ -500,6 +546,9 @@ func (s *wsService) PublishToTopics(topics []string, event RealtimeEvent) {
 	class := classifyEmployeeRealtimeEvent(event.Type)
 	for _, delivery := range deliveries {
 		session, topic := delivery.Session, delivery.DeliveryTopic
+		if !s.validateEmployeeDelivery(session, time.Now()) {
+			continue
+		}
 		if session.Role == realtimeRoleUser && session.External != nil && strings.HasPrefix(topic, "conversation:") {
 			conversationID, ok := parseConversationTopic(topic)
 			if !ok || !s.canSubscribeConversation(session, conversationID) {
@@ -528,6 +577,9 @@ func (s *wsService) PublishToTopics(topics []string, event RealtimeEvent) {
 			continue
 		}
 		if session.Role == realtimeRoleAdmin && !s.CanReceiveEvent(session, delivery.topic, class) {
+			continue
+		}
+		if !s.validateEmployeeDelivery(session, time.Now()) {
 			continue
 		}
 		if session.enqueue(payload) {
@@ -595,9 +647,38 @@ func (s *wsService) defaultTopics(session *ClientSession) []string {
 	}
 }
 
+// Default admission uses the fresh snapshot before activation publishes its
+// principal and topics together. Policy helpers remain independent of phase.
+func (s *wsService) employeeDefaultTopics(session *ClientSession, snapshot EmployeeSessionSnapshot) []string {
+	if session == nil {
+		return nil
+	}
+	return s.defaultTopics(&ClientSession{Role: session.Role, Principal: snapshot.Principal})
+}
+
+func canDeliverEmployeeRealtime(session *ClientSession, now time.Time) bool {
+	return session != nil && employeeLifecyclePhase(session.employeePhase.Load()) == employeePhaseActive && !session.Closed.Load() && now.Before(session.LifecycleDeadline)
+}
+
+func (s *wsService) validateEmployeeDelivery(session *ClientSession, now time.Time) bool {
+	if !isEmployeeRealtimeSession(session) {
+		return true
+	}
+	if canDeliverEmployeeRealtime(session, now) {
+		return true
+	}
+	if employeeLifecyclePhase(session.employeePhase.Load()) == employeePhaseActive && !now.Before(session.LifecycleDeadline) {
+		s.closeSession(session)
+	}
+	return false
+}
+
 func (s *wsService) filterAllowedTopics(session *ClientSession, topics []string) []string {
 	normalized := normalizeRealtimeTopics(topics)
 	if len(normalized) == 0 || session == nil {
+		return nil
+	}
+	if !s.validateEmployeeDelivery(session, time.Now()) {
 		return nil
 	}
 	switch session.Role {

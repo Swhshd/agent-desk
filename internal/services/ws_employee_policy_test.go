@@ -34,7 +34,11 @@ func TestDashboardRealtimeDefaultTopics(t *testing.T) {
 		{"external missing customer", &ClientSession{Role: realtimeRoleUser, External: &openidentity.ExternalUser{ExternalID: "guest-101"}}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := svc.defaultTopics(tc.session); !slices.Equal(got, tc.want) {
+			got := svc.defaultTopics(tc.session)
+			if isEmployeeRealtimeSession(tc.session) {
+				got = svc.employeeDefaultTopics(tc.session, EmployeeSessionSnapshot{Principal: tc.session.Principal})
+			}
+			if !slices.Equal(got, tc.want) {
 				t.Fatalf("default topics = %v, want %v", got, tc.want)
 			}
 		})
@@ -290,10 +294,18 @@ func TestDashboardRealtimeSubscriptionAdmission(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			svc := newWsServiceForTest()
-			session := &ClientSession{ID: name, Role: realtimeRoleAdmin, Principal: principal, Topics: make(map[string]struct{})}
-			markActiveEmployeeTestSession(session)
-			svc.manager.Register(session, nil)
-			t.Cleanup(func() { svc.manager.Unregister(session) })
+			snapshot := EmployeeSessionSnapshot{EmployeeID: 101, LoginSessionID: 1000101, LoginSessionExpiresAt: time.Now().Add(time.Hour), Principal: principal}
+			session := &ClientSession{ID: name, Role: realtimeRoleAdmin, Principal: principal, EmployeeID: 101, LoginSessionID: 1000101, Topics: make(map[string]struct{}), Send: make(chan []byte, realtimeSendBufferSize)}
+			if !svc.manager.RegisterPending(session) {
+				t.Fatal("pending fixture registration failed")
+			}
+			if !svc.lifecycle.InstallLifecycleTimer(session, employeeLifecycleDeadline(snapshot)) {
+				t.Fatal("fixture lifecycle timer failed")
+			}
+			if _, activated := svc.manager.Activate(session, snapshot, nil); !activated {
+				t.Fatal("fixture activation failed")
+			}
+			t.Cleanup(func() { svc.closeSession(session) })
 			// The existing explicit-conversation rejection must remain effective.
 			got := svc.filterAllowedTopics(session, []string{"conversation:42"})
 			if withView && !slices.Equal(got, []string{"conversation:42"}) {

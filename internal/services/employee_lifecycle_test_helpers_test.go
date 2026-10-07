@@ -17,8 +17,10 @@ import (
 // read is synthetic; each handshake must explicitly bind its trusted snapshot.
 type employeeWsTestLifecycle struct {
 	*employeeRealtimeLifecycle
-	mu        sync.Mutex
-	snapshots map[int64]EmployeeSessionSnapshot
+	mu          sync.Mutex
+	snapshots   map[int64]EmployeeSessionSnapshot
+	beforeRead  func(int64)
+	readCurrent func(int64, time.Time) (EmployeeSessionSnapshot, error)
 }
 
 func newWsServiceForTest() *wsService {
@@ -27,7 +29,13 @@ func newWsServiceForTest() *wsService {
 	return newWsService(manager, lifecycle)
 }
 
-func (l *employeeWsTestLifecycle) RevalidateEmployeeSession(id int64, _ time.Time) (EmployeeSessionSnapshot, error) {
+func (l *employeeWsTestLifecycle) RevalidateEmployeeSession(id int64, now time.Time) (EmployeeSessionSnapshot, error) {
+	if l.beforeRead != nil {
+		l.beforeRead(id)
+	}
+	if l.readCurrent != nil {
+		return l.readCurrent(id, now)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	snapshot, ok := l.snapshots[id]
