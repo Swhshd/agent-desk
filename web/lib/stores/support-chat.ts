@@ -5,7 +5,10 @@ import { create } from "zustand"
 import {
   closeImConversation,
   createOrMatchImConversation,
+  beginCustomerSessionBootstrap,
+  departCustomerSessionIdentity,
   ensureCustomerSession,
+  isCustomerSessionContinuityLost,
   fetchImMessages,
   fetchImWidgetConfig,
   markImMessageRead,
@@ -15,9 +18,12 @@ import {
   applyCustomerSessionRefresh,
   type ImAsset,
   type ImConversation,
+  type ImCustomerSession,
+  type ImCustomerSessionCustomer,
   type ImMessage,
   type ImWidgetConfig,
 } from "@/lib/api/im"
+import { isCustomerSessionAttemptCurrent } from "@/lib/api/im-session-scope"
 import {
   createImRealtimeConnection,
   type ImRealtimeEnvelope,
@@ -111,6 +117,8 @@ export type SupportChatStore = {
   title: string
   subtitle: string
   themeColor: string
+  customer: ImCustomerSessionCustomer | null
+  customerChannelId: string
   conversation: ImConversation | null
   messages: ImMessage[]
   messagesCursor: string
@@ -150,16 +158,19 @@ function t(key: string) {
 }
 
 export const useSupportChatStore = create<SupportChatStore>((set, get) => {
+  let resettingCustomerState = false
   const realtime = createRealtimeConnectionManager({
     createSocket: createImRealtimeConnection,
     canReconnect: () => Boolean(get().isOpen && get().conversation?.id),
     onStatusChange: (status) => {
-      if (get().isOpen || status === "disconnected") {
+      if (!resettingCustomerState && (get().isOpen || status === "disconnected")) {
         set({ status })
       }
     },
     onSocketChange: (socket) => {
-      set({ socket })
+      if (!resettingCustomerState) {
+        set({ socket })
+      }
     },
     onMessage: (messageEvent) => {
       let event: ImRealtimeEnvelope
@@ -232,13 +243,55 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
     if (!get().conversation?.id) {
       return
     }
+    const socket = get().socket
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      return
+    }
     realtime.connect()
+  }
+
+  const resetCustomerState = (customer: ImCustomerSessionCustomer | null, channelId: string): void => {
+    resettingCustomerState = true
+    try {
+      realtime.disconnect({ reconnect: false, updateStatus: false })
+    } finally {
+      resettingCustomerState = false
+    }
+    set({
+      customer,
+      customerChannelId: channelId,
+      conversation: null,
+      messages: [],
+      messagesCursor: "",
+      messagesHasMore: false,
+      messagesLoadingMore: false,
+      initialized: false,
+      error: "",
+      sending: false,
+      uploadingAsset: false,
+      closingConversation: false,
+      readingMessageId: 0,
+      socket: null,
+      status: "connecting",
+    })
+  }
+
+  const acceptCustomerSession = (session: ImCustomerSession): void => {
+    const state = get()
+    if (state.customer?.id !== session.customer.id || state.customerChannelId !== session.channelId) {
+      // The API has already activated the accepted identity scope.
+      resetCustomerState(session.customer, session.channelId)
+      return
+    }
+    set({ customer: session.customer, customerChannelId: session.channelId })
   }
 
   return {
     title: t("supportChat.title"),
     subtitle: "",
     themeColor: "#2563eb",
+    customer: null,
+    customerChannelId: "",
     conversation: null,
     messages: [],
     messagesCursor: "",
@@ -266,6 +319,14 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
 
     bootstrap: () => {
       const token = ++bootstrapToken
+      let attempt = beginCustomerSessionBootstrap()
+      // A valid proof inside the cache margin renews without departing identity.
+      if (isCustomerSessionContinuityLost()) {
+        departCustomerSessionIdentity()
+        resetCustomerState(null, readSupportChatRuntimeConfig().channelId || "")
+      }
+      const isCurrentBootstrap = () => bootstrapToken === token &&
+        isCustomerSessionAttemptCurrent(attempt) && get().isOpen
 
       if (!get().isOpen) {
         closeSocket({ reconnect: false })
@@ -275,51 +336,58 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
 
       const activateChat = async () => {
         try {
-          set({ error: "", status: "connecting" })
+          set({
+            error: "",
+            status: get().socket?.readyState === WebSocket.OPEN ? "connected" : "connecting",
+          })
 
           const widgetConfig: ImWidgetConfig = await fetchImWidgetConfig().catch(
             () => ({})
           )
-          if (bootstrapToken !== token || !get().isOpen) {
+          if (!isCurrentBootstrap()) {
             return
           }
 
-          if (widgetConfig.channelId) {
+          if (widgetConfig.channelId && widgetConfig.channelId !== readSupportChatRuntimeConfig().channelId) {
             setSupportChatRuntimeConfig({
               ...readSupportChatRuntimeConfig(),
               channelId:
                 widgetConfig.channelId || readSupportChatRuntimeConfig().channelId,
             })
+            departCustomerSessionIdentity()
+            resetCustomerState(null, widgetConfig.channelId)
+            attempt = beginCustomerSessionBootstrap()
           }
 
           set({
-            title: widgetConfig.title || t("supportChat.title"),
-            subtitle: widgetConfig.subtitle || "",
-            themeColor: widgetConfig.themeColor || "#2563eb",
+            title: widgetConfig.title || get().title,
+            subtitle: widgetConfig.subtitle ?? get().subtitle,
+            themeColor: widgetConfig.themeColor || get().themeColor,
           })
 
-          await ensureCustomerSession()
-          if (bootstrapToken !== token || !get().isOpen) {
+          const session = await ensureCustomerSession(attempt)
+          if (!isCurrentBootstrap()) {
             return
           }
+          acceptCustomerSession(session)
 
           let currentConversation = get().conversation
           if (!get().initialized || !currentConversation) {
             currentConversation = await createOrMatchImConversation()
-            if (bootstrapToken !== token || !get().isOpen) {
+            if (!isCurrentBootstrap()) {
               return
             }
             set({ initialized: true, conversation: currentConversation })
           }
 
           await get().refreshMessages()
-          if (bootstrapToken !== token || !get().isOpen) {
+          if (!isCurrentBootstrap()) {
             return
           }
 
           connectSocket()
         } catch (error) {
-          if (bootstrapToken !== token || !get().isOpen) {
+          if (!isCurrentBootstrap()) {
             return
           }
           set({
