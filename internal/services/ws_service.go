@@ -585,6 +585,11 @@ func (s *wsService) PublishToTopics(topics []string, event RealtimeEvent) {
 		if session.enqueue(payload) {
 			continue
 		}
+		// Enqueue rechecks employee eligibility under sendMu. If its lock wait
+		// reached the deadline, terminal close runs here after releasing sendMu.
+		if !s.validateEmployeeDelivery(session, time.Now()) {
+			continue
+		}
 		slog.Warn("drop slow realtime client",
 			"connId", session.ID,
 			"type", event.Type,

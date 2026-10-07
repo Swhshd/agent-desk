@@ -56,26 +56,49 @@ func (m *WsConnectionManager) Unregister(session *ClientSession) int {
 }
 
 func (m *WsConnectionManager) Subscribe(session *ClientSession, topics []string) []string {
+	added, expired := m.subscribeWithEmployeeEligibility(session, topics)
+	// Close unregisters through manager.mu, so both admission locks must be
+	// released before terminal cleanup.
+	if expired {
+		m.CloseSession(session)
+	}
+	return added
+}
+
+func (m *WsConnectionManager) subscribeWithEmployeeEligibility(session *ClientSession, topics []string) ([]string, bool) {
 	if session == nil || len(topics) == 0 {
-		return nil
+		return nil, false
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Task 3 replaces legacy NEW employee registrations with strict activation.
-	if session.Closed.Load() || (isEmployeeRealtimeSession(session) && employeeLifecyclePhase(session.employeePhase.Load()) == employeePhasePending) {
-		return nil
+	employee := isEmployeeRealtimeSession(session)
+	if employee {
+		// Match activation's manager.mu -> sendMu order and fence terminal close
+		// against membership insertion. Customer admission keeps its own branch.
+		session.sendMu.Lock()
+		defer session.sendMu.Unlock()
+	}
+	if session.Closed.Load() {
+		return nil, false
 	}
 
 	ret := make([]string, 0, len(topics))
 	for _, topic := range topics {
+		if employee {
+			now := time.Now()
+			if !canDeliverEmployeeRealtime(session, now) {
+				expired := employeeLifecyclePhase(session.employeePhase.Load()) == employeePhaseActive && !now.Before(session.LifecycleDeadline)
+				return nil, expired
+			}
+		}
 		if _, exists := session.Topics[topic]; exists {
 			continue
 		}
 		m.subscribeLocked(session, topic)
 		ret = append(ret, topic)
 	}
-	return ret
+	return ret, false
 }
 
 func (m *WsConnectionManager) Unsubscribe(session *ClientSession, topics []string, keep map[string]struct{}) []string {

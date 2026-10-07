@@ -311,6 +311,11 @@ func (s *ClientSession) enqueueWithBeforeSend(payload []byte, beforeSend func())
 	if s.Closed.Load() {
 		return false
 	}
+	// Eligibility must cover the actual send, including time spent waiting for
+	// sendMu. The service closes an expired rejection after this lock releases.
+	if isEmployeeRealtimeSession(s) && !canDeliverEmployeeRealtime(s, time.Now()) {
+		return false
+	}
 	select {
 	case s.Send <- payload:
 		return true

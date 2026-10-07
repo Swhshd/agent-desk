@@ -22,6 +22,100 @@ import (
 func TestWsPendingMutationBeforeRegistration(t *testing.T) { testWsPendingRevokeOrdering(t, true) }
 func TestWsPendingRegistrationBeforeCallback(t *testing.T) { testWsPendingRevokeOrdering(t, false) }
 
+func TestEmployeeDeliveryDeadlineAtSendLock(t *testing.T) {
+	svc := newWsServiceForTest()
+	session := &ClientSession{ID: "deadline-at-send", Role: realtimeRoleNotification, Principal: employeeViewPrincipal(), Topics: make(map[string]struct{}), Send: make(chan []byte, 64)}
+	markActiveEmployeeTestSession(session)
+	svc.manager.Register(session, []string{"notification:101"})
+	var logs wsSessionConcurrencyLogBuffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(previousLogger)
+	session.sendMu.Lock()
+	var unlock sync.Once
+	release := func() { unlock.Do(session.sendMu.Unlock) }
+	defer release()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.PublishToTopic("notification:101", RealtimeEvent{EventID: "protected-deadline-marker", Type: enums.IMRealtimeEventNotificationCreated, Data: RealtimeNotificationCreatedPayload{}})
+	}()
+	// Stack observation fences the actual post-validation enqueue lock wait;
+	// no elapsed duration is used to establish the ordering.
+	waitWsGoroutineStacks(t, "employee enqueue waiting on sendMu", func(stacks map[string]string) bool {
+		for _, stack := range stacks {
+			if strings.Contains(stack, "(*ClientSession).enqueueWithBeforeSend(") && strings.Contains(stack, "sync.(*Mutex).Lock(") {
+				return true
+			}
+		}
+		return false
+	})
+	session.LifecycleDeadline = time.Now()
+	release()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadline enqueue did not finish after lock release")
+	}
+	if len(session.Send) != 0 {
+		t.Fatal("protected output crossed deadline while waiting for sendMu")
+	}
+	if !session.Closed.Load() || svc.manager.Count() != 0 {
+		t.Fatal("expired enqueue did not close outside sendMu")
+	}
+	svc.closeSession(session)
+	if logs.count([]byte(`"connId":"deadline-at-send"`)) != 1 {
+		t.Fatal("expired enqueue did not close exactly once")
+	}
+}
+
+func TestEmployeeDeliveryDeadlineAtSubscriptionLock(t *testing.T) {
+	svc := newWsServiceForTest()
+	session := &ClientSession{ID: "deadline-at-subscribe", Role: realtimeRoleAdmin, Principal: employeeViewPrincipal(), Topics: make(map[string]struct{}), Send: make(chan []byte, 64)}
+	markActiveEmployeeTestSession(session)
+	svc.manager.Register(session, nil)
+	var logs wsSessionConcurrencyLogBuffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(previousLogger)
+	svc.manager.mu.Lock()
+	var unlock sync.Once
+	release := func() { unlock.Do(svc.manager.mu.Unlock) }
+	defer release()
+	done := make(chan []string, 1)
+	go func() { done <- svc.subscribeTopics(session, []string{"conversation:42"}) }()
+	waitWsGoroutineStacks(t, "employee subscription waiting on manager.mu", func(stacks map[string]string) bool {
+		for _, stack := range stacks {
+			if strings.Contains(stack, "(*WsConnectionManager).Subscribe(") && strings.Contains(stack, "sync.(*RWMutex).Lock(") {
+				return true
+			}
+		}
+		return false
+	})
+	session.sendMu.Lock()
+	session.LifecycleDeadline = time.Now()
+	session.sendMu.Unlock()
+	release()
+	select {
+	case topics := <-done:
+		if len(topics) != 0 {
+			t.Fatalf("expired subscription acknowledged %v", topics)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expired admission deadlocked closing with manager.mu held")
+	}
+	if svc.manager.HasTopic("conversation:42") || len(session.Topics) != 0 {
+		t.Fatal("expired membership inserted after manager lock wait")
+	}
+	if !session.Closed.Load() || svc.manager.Count() != 0 {
+		t.Fatal("expired admission did not close after releasing manager.mu")
+	}
+	svc.closeSession(session)
+	if logs.count([]byte(`"connId":"deadline-at-subscribe"`)) != 1 {
+		t.Fatal("expired admission did not close exactly once")
+	}
+}
+
 func testWsPendingRevokeOrdering(t *testing.T, revokeBeforeRegistration bool) {
 	db := lifecycleAuthTestDB(t)
 	grant := createRBACTestGrant(t, db, "conversation.view", enums.StatusOk, enums.StatusOk, true, nil, nil)
