@@ -20,13 +20,14 @@ import (
 	"gorm.io/gorm"
 )
 
-var UserService = newUserService()
+var UserService = newUserService(employeeRealtime)
 
-func newUserService() *userService {
-	return &userService{}
+func newUserService(invalidator EmployeeRealtimeInvalidator) *userService {
+	return &userService{invalidator: invalidator}
 }
 
 type userService struct {
+	invalidator EmployeeRealtimeInvalidator
 }
 
 func (s *userService) Get(id int64) *models.User {
@@ -191,6 +192,7 @@ func (s *userService) DeleteUser(id int64, operator *dto.AuthPrincipal) error {
 	}); err != nil {
 		return err
 	}
+	s.invalidator.InvalidateEmployees([]int64{id})
 	return LoginSessionService.RevokeByUser(id, operator.UserID, operator.Username)
 }
 
@@ -211,6 +213,7 @@ func (s *userService) UpdateStatus(id int64, status int, operator *dto.AuthPrinc
 		return err
 	}
 	if status == int(enums.StatusDisabled) || status == int(enums.StatusDeleted) {
+		s.invalidator.InvalidateEmployees([]int64{id})
 		return LoginSessionService.RevokeByUser(id, operator.UserID, operator.Username)
 	}
 	return nil
@@ -247,7 +250,11 @@ func (s *userService) AssignRoles(userID int64, roleIDs []int64, operator *dto.A
 
 func (s *userService) replaceUserRoles(userID int64, roleIDs []int64, operator *dto.AuthPrincipal) error {
 	return sqls.WithTransaction(func(ctx *sqls.TxContext) error {
-		return s.replaceUserRolesDB(ctx.Tx, userID, roleIDs, operator)
+		if err := s.replaceUserRolesDB(ctx.Tx, userID, roleIDs, operator); err != nil {
+			return err
+		}
+		ctx.RegisterCallback(func() { s.invalidator.InvalidateEmployees([]int64{userID}) })
+		return nil
 	})
 }
 
@@ -256,7 +263,7 @@ func (s *userService) replaceUserRolesDB(db *gorm.DB, userID int64, roleIDs []in
 		return err
 	}
 	for _, roleID := range roleIDs {
-		role := RoleService.Get(roleID)
+		role := repositories.RoleRepository.Get(db, roleID)
 		if role == nil {
 			return errorsx.InvalidParamI18n("error.e0305")
 		}

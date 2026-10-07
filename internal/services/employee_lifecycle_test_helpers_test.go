@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"agent-desk/internal/models"
 	"agent-desk/internal/pkg/dto"
+	"agent-desk/internal/pkg/enums"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mlogclub/simple/sqls"
@@ -83,4 +85,77 @@ func lifecycleAuthTestDB(t *testing.T) *gorm.DB {
 		}
 	})
 	return db
+}
+
+// Mutation observers inspect committed state before delegating to real closes.
+type employeeMutationInvalidator struct {
+	*employeeRealtimeLifecycle
+	onLogin     func(int64)
+	onEmployees func([]int64)
+}
+
+func (l *employeeMutationInvalidator) InvalidateLoginSession(id int64) int {
+	if l.onLogin != nil {
+		l.onLogin(id)
+	}
+	return l.employeeRealtimeLifecycle.InvalidateLoginSession(id)
+}
+
+func (l *employeeMutationInvalidator) InvalidateEmployees(ids []int64) int {
+	if l.onEmployees != nil {
+		l.onEmployees(ids)
+	}
+	return l.employeeRealtimeLifecycle.InvalidateEmployees(ids)
+}
+
+func employeeMutationFixture(t *testing.T) (*gorm.DB, *employeeMutationInvalidator, *models.User, *dto.AuthPrincipal) {
+	t.Helper()
+	db := lifecycleAuthTestDB(t)
+	user := createAuthTestUser(t, db, "mutation-employee", "old-password")
+	if err := db.Model(user).Update("user_type", enums.UserTypeEmployee).Error; err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := &employeeMutationInvalidator{employeeRealtimeLifecycle: newEmployeeRealtimeLifecycle(newWsConnectionManager(), employeeAuthStateReader{})}
+	previous := LoginSessionService
+	LoginSessionService = newLoginSessionService(lifecycle)
+	t.Cleanup(func() { LoginSessionService = previous })
+	return db, lifecycle, user, &dto.AuthPrincipal{UserID: user.ID, Username: user.Username}
+}
+
+func employeeMutationSockets(t *testing.T, l *employeeMutationInvalidator, userID, loginID int64, prefix string) (*ClientSession, *ClientSession) {
+	t.Helper()
+	return lifecycleTestSession(t, l.manager, prefix+"-pending", userID, loginID, false),
+		lifecycleTestSession(t, l.manager, prefix+"-active", userID, loginID, true)
+}
+
+func employeeMutationLogin(t *testing.T, db *gorm.DB, userID int64, token string) models.LoginSession {
+	t.Helper()
+	now := time.Now()
+	row := models.LoginSession{UserID: userID, Token: token, ClientType: "admin_web", ExpiredAt: now.Add(time.Hour), AuditFields: models.AuditFields{CreatedAt: now, UpdatedAt: now}}
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func employeeMutationReadLogin(t *testing.T, db *gorm.DB, id int64) models.LoginSession {
+	t.Helper()
+	var row models.LoginSession
+	if err := db.First(&row, id).Error; err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func employeeMutationFailUpdate(t *testing.T, db *gorm.DB, table string, failure error) {
+	t.Helper()
+	const name = "test:employee_mutation_update_failure"
+	if err := db.Callback().Update().Before("gorm:update").Register(name, func(tx *gorm.DB) {
+		if tx.Statement.Table == table {
+			tx.AddError(failure)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Callback().Update().Remove(name) })
 }

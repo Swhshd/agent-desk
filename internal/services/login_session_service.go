@@ -11,13 +11,14 @@ import (
 	"github.com/mlogclub/simple/sqls"
 )
 
-var LoginSessionService = newLoginSessionService()
+var LoginSessionService = newLoginSessionService(employeeRealtime)
 
-func newLoginSessionService() *loginSessionService {
-	return &loginSessionService{}
+func newLoginSessionService(invalidator EmployeeRealtimeInvalidator) *loginSessionService {
+	return &loginSessionService{invalidator: invalidator}
 }
 
 type loginSessionService struct {
+	invalidator EmployeeRealtimeInvalidator
 }
 
 func (s *loginSessionService) Get(id int64) *models.LoginSession {
@@ -74,22 +75,30 @@ func (s *loginSessionService) Revoke(id int64, operatorID int64, operatorName st
 		return errorsx.InvalidParamI18n("error.e0116")
 	}
 	now := time.Now()
-	return s.Updates(id, map[string]any{
+	if err := s.Updates(id, map[string]any{
 		"revoked_at":       now,
 		"update_user_id":   operatorID,
 		"update_user_name": operatorName,
 		"updated_at":       now,
-	})
+	}); err != nil {
+		return err
+	}
+	s.invalidator.InvalidateLoginSession(id)
+	return nil
 }
 
 func (s *loginSessionService) RevokeByUser(userID int64, operatorID int64, operatorName string) error {
 	now := time.Now()
-	return sqls.DB().Model(&models.LoginSession{}).
+	if err := sqls.DB().Model(&models.LoginSession{}).
 		Where("user_id = ? AND revoked_at IS NULL", userID).
 		Updates(map[string]any{
 			"revoked_at":       now,
 			"update_user_id":   operatorID,
 			"update_user_name": operatorName,
 			"updated_at":       now,
-		}).Error
+		}).Error; err != nil {
+		return err
+	}
+	s.invalidator.InvalidateEmployees([]int64{userID})
+	return nil
 }

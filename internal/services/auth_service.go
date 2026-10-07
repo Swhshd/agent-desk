@@ -148,15 +148,13 @@ func (s *authService) Login(req request.LoginRequest, authCfg config.AuthConfig,
 
 func (s *authService) Logout(accessToken string) error {
 	accessToken = s.extractBearerToken(accessToken)
-	now := time.Now()
 	if accessToken != "" {
 		if session := LoginSessionService.FindOne(sqls.NewCnd().Eq("token", accessToken)); session != nil && session.RevokedAt == nil {
-			if err := LoginSessionService.Updates(session.ID, map[string]any{
-				"revoked_at": now,
-				"updated_at": now,
-			}); err != nil {
-				return err
+			username := ""
+			if user := UserService.Get(session.UserID); user != nil {
+				username = user.Username
 			}
+			return LoginSessionService.Revoke(session.ID, session.UserID, username)
 		}
 	}
 	return nil
