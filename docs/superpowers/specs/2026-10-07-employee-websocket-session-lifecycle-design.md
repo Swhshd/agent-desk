@@ -43,7 +43,7 @@ Adopt the approved event-driven, precise design:
 4. The socket receives a single deadline equal to the earlier of LoginSession ExpiredAt and the next active direct-override ExpiredAt.
 5. Activation atomically installs the fresh principal and employee default topics only if the pending connection remains registered and open.
 6. Supported mutation services persist first and invalidate after commit or after the successful single-row write.
-7. The coordinator scans the existing manager sessions map. No user/session secondary indexes are added.
+7. The coordinator scans the existing manager sessions map. No user/session secondary indexes are added. Authorization-object mutations capture stable role/permission impact keys before commit and resolve relation-derived employee IDs from committed state afterward; direct-user mutations keep their directly known targets.
 8. The server closes at the deadline even with no client activity. A browser checks the existing profile endpoint before deciding whether to stop or continue reconnecting.
 
 The flow is:
@@ -80,7 +80,8 @@ An employee `ClientSession` must carry server-derived lifecycle metadata:
 - `Principal *dto.AuthPrincipal`
 - `NextAuthzChangeAt *time.Time`
 - `LifecycleDeadline time.Time`
-- lifecycle state PENDING, ACTIVE, or CLOSED
+- employee lifecycle phase NEW, PENDING, or ACTIVE; terminal state remains exclusively the existing PR #4 `session.Closed` flag
+- `lifecycleTimerMu sync.Mutex` and `lifecycleTimer *time.Timer`, used only to publish/detach the timer reference, never as a second terminal-state lock
 - the existing connection ID, connection, topics, send queue, and PR #4 close synchronization
 
 `EmployeeID` must equal the validated session's UserID and `Principal.UserID`. The LoginSession ID and ExpiredAt come only from the LoginSession row selected by AuthService after validating the bearer token. No client-provided ID, query parameter, connected payload, or event envelope may set or override them.
@@ -143,7 +144,13 @@ Authentication and revalidation share the same authorization-snapshot query/aggr
 
 ## 8. Pending / Active Connection State Machine
 
-Use explicit states NEW → PENDING → ACTIVE → CLOSED. CLOSED is terminal.
+The stored employee lifecycle phase is NEW → PENDING → ACTIVE. There is no stored `CLOSED` phase: terminal state is exclusively the existing PR #4 `session.Closed` flag. The conceptual state diagram is:
+
+~~~text
+NEW → PENDING → ACTIVE
+ |       |            |
+ +-------+------------+→ terminal Closed (existing PR #4 session.Closed)
+~~~
 
 The employee connection sequence is:
 
@@ -152,14 +159,14 @@ The employee connection sequence is:
 3. `WsConnectionManager.RegisterPending(session)` inserts it into `sessions` only and transitions it to PENDING. It adds no topic memberships.
 4. The lifecycle coordinator revalidates by LoginSession ID.
 5. The handler computes the single lifecycle deadline and installs its timer while the session is still pending.
-6. `WsConnectionManager.Activate(session, freshSnapshot, defaultTopics)` takes the manager lock, verifies the pointer is still registered under its connection ID, the session is not closed, and the state is still PENDING; it atomically replaces the principal and deadline metadata, transitions to ACTIVE, and inserts the employee default topics.
+6. `WsConnectionManager.Activate(session, freshSnapshot, defaultTopics)` takes the manager lock and requires all of: the exact same pointer is still registered under its connection ID, phase is PENDING, and authoritative `session.Closed == false`. It atomically replaces the principal and deadline metadata, transitions the phase to ACTIVE, and inserts the employee default topics.
 7. Only after activation does the handler enqueue connected/control output and start the read and write pumps. If the session closed between activation and pump start, it does not start new pumps.
 
-No connected event containing employee state is emitted before successful activation. A close during pending registration is terminal and cannot be undone by a later activation.
+No connected event containing employee state is emitted before successful activation. A close during pending registration sets the authoritative PR #4 `Closed` state and cannot be undone by a later activation; no separate lifecycle CLOSED value is written.
 
 ## 9. Protected Delivery Boundary
 
-Only ACTIVE employee sessions with a future LifecycleDeadline may receive employee protected queue, conversation, or notification delivery. The manager's topic membership is added only at activation, and delivery policy also checks ACTIVE state and the deadline before enqueue. If the deadline is reached before the timer callback runs, the delivery check closes the socket and rejects the event.
+Employee protected queue, conversation, or notification delivery requires phase ACTIVE, authoritative `session.Closed == false`, and `now < LifecycleDeadline`. The manager's topic membership is added only at activation. If the deadline is reached before the timer callback runs, the delivery check closes the socket and rejects the event.
 
 PENDING receives no protected fan-out, including conversation queue data, notifications, and user-specific employee messages. It is present only so a concurrent invalidator can find and close it.
 
@@ -173,6 +180,7 @@ Define the mutation-facing port in `internal/services/employee_realtime_lifecycl
 type EmployeeRealtimeInvalidator interface {
     InvalidateLoginSession(loginSessionID int64) int
     InvalidateEmployees(employeeIDs []int64) int
+    InvalidateAllEmployees() int
 }
 ~~~
 
@@ -180,8 +188,9 @@ type EmployeeRealtimeInvalidator interface {
 
 - `InvalidateLoginSession` matches only employee sessions whose trusted LoginSessionID equals the requested ID.
 - `InvalidateEmployees` matches only employee sessions whose EmployeeID belongs to the precise supplied set.
-- Both operations include PENDING and ACTIVE sessions and exclude customer/guest sockets.
-- Return value is the count of sessions that transitioned to CLOSED during this call; already-closed or absent targets are harmless and do not inflate the count.
+- `InvalidateAllEmployees` is an exceptional fail-closed fallback only after an authorization mutation commits and post-commit precise impact resolution fails. It scans current PENDING and ACTIVE employee sessions, excludes customer/guest sockets, snapshots pointers under the manager read lock, closes outside the manager lock, does not revoke LoginSessions, and returns the number actually closed. It is never used on the normal successfully resolved path.
+- All three operations target only employee realtime sessions in PENDING or ACTIVE and exclude customer/guest sockets; `InvalidateAllEmployees` does not revoke LoginSessions.
+- Return value is the count of sessions that became terminal through the authoritative `session.Closed` transition during this call; already-closed or absent targets are harmless and do not inflate the count.
 
 No target is a normal zero-count result. A database mutation is not rolled back because a socket is absent or already closed.
 
@@ -191,17 +200,17 @@ No target is a normal zero-count result. A database mutation is not rolled back 
 
 Add a manager scan that copies matching employee session pointers while holding `RLock`, then releases the lock before invoking the close primitive. The scan includes PENDING and ACTIVE states. It filters on server-bound EmployeeID/LoginSessionID and employee realtime role, never client input.
 
-Registration and activation occur under the manager write lock. PENDING and ACTIVE remain in the same `sessions` map. PENDING has no entries in `topics`. Activation checks registration identity and terminal state while holding the lock.
+Registration and activation occur under the manager write lock. PENDING and ACTIVE remain in the same `sessions` map. PENDING has no entries in `topics`. `Activate` requires the exact registered pointer, phase PENDING, and authoritative `session.Closed == false` while holding the manager lock; there is no separate CLOSED lifecycle phase.
 
 The manager lock is never held while closing a target. `closeSession` unregisters through the manager; calling it while holding the manager lock would recursively lock and deadlock.
 
 ## 12. PR #4 Close Primitive Reuse
 
-Reuse the PR #4 close-once/enqueue synchronization exactly: `closeOnce`, `sendMu`, setting terminal closed state before closing the Send channel, manager unregister, and connection close. Do not invent a second shutdown path or weaken send/close ordering.
+Reuse the PR #4 close-once/enqueue synchronization exactly: `closeOnce`, `sendMu`, setting authoritative `session.Closed` before closing the Send channel, manager unregister, and connection close. Do not invent a second shutdown path or weaken send/close ordering. The employee phase remains NEW/PENDING/ACTIVE; close does not write a second CLOSED phase.
 
 To keep the constructor graph acyclic, extract the existing close primitive from `wsService.closeSession` into one manager-owned operation, `WsConnectionManager.CloseSession(session) bool`. `wsService.closeSession` remains the wrapper for normal pump shutdown and logging; the lifecycle coordinator calls the same manager operation. The `bool` is true only for the caller that performed the close-once transition.
 
-The manager operation stops any installed lifecycle timer before unregistering, releases timer/session locks before manager Unregister, and does not hold the manager lock while closing. The existing `sendMu`/`closeOnce` roles and lock order remain unchanged.
+Within the existing `closeOnce` path, the manager operation first performs the authoritative PR #4 terminal transition (`Closed.Store(true)` under the existing send/close synchronization and closes Send), then detaches the optional lifecycle timer reference under `lifecycleTimerMu`, releases that mutex, and calls `Timer.Stop()` if non-nil. It then unregisters and closes the connection. It never holds the manager lock while stopping a timer or closing a target, and it releases the timer mutex before `Unregister`. The existing `sendMu`/`closeOnce` roles and lock order remain unchanged. `Timer.Stop() == false` means the callback may already have started; it does not wait for callback completion. `CloseSession` never waits for an `AfterFunc` callback.
 
 ## 13. Login Session Expiry
 
@@ -221,15 +230,16 @@ If the earliest override is redundant with role permissions, the socket may reco
 
 ## 15. Timer Concurrency and Cleanup
 
-Each employee socket has exactly one timer for `min(LoginSessionExpiresAt, NextAuthzChangeAt when present)`. No timer is created for customer/guest sockets.
+Each employee socket has at most one installed timer for `min(LoginSessionExpiresAt, NextAuthzChangeAt when present)`. No timer is created for customer/guest sockets. `lifecycleTimerMu sync.Mutex` protects only the `lifecycleTimer *time.Timer` reference; it is not a terminal-state lock. The authoritative terminal truth remains PR #4 `session.Closed`.
 
-- A deadline at or before activation time rejects activation and closes the pending socket.
-- The timer callback uses the same `WsConnectionManager.CloseSession` primitive as explicit revoke and pump termination.
-- Any earlier terminal close stops the timer. If the callback is already running, `closeOnce` makes the race harmless.
-- Timer callbacks hold no manager lock and no timer/session mutex while closing.
-- The timer is installed before activation. If it fires while PENDING, it closes the pending connection and activation fails.
-- Timer/revoke races have one terminal close, one channel close, and no panic/deadlock.
-- A closed socket does not retain an avoidable long-duration timer.
+- After authoritative revalidation, a deadline at or before the captured current time rejects activation and closes the pending socket without retaining a timer. Timer installation also rechecks the deadline before publishing the reference; if it has been reached, it stops the newly scheduled timer and fails closed.
+- Installation creates/schedules the timer, acquires `lifecycleTimerMu`, and rechecks both `session.Closed` and that the deadline is still in the future. If either check fails, it does not store the timer, releases the mutex, stops the new timer, closes the pending session through `CloseSession` outside the mutex, and activation fails. If both checks pass, it stores the pointer and releases the mutex. If the timer callback runs before publication, its `CloseSession` makes `session.Closed` authoritative and the install recheck discards the timer. No `CloseSession` call or user callback runs while holding `lifecycleTimerMu`.
+- Close first makes `session.Closed` authoritative through the existing PR #4 close-once path, then acquires `lifecycleTimerMu`, copies and clears `lifecycleTimer`, releases the mutex, and stops the detached timer outside both the timer mutex and manager lock.
+- If installation wins first, a later close finds, detaches, and stops the installed timer. If close wins first, installation observes `Closed`, retains no timer, and stops the unreferenced timer. Therefore no long-duration timer remains attached to a closed employee socket.
+- The timer callback uses the same `WsConnectionManager.CloseSession` primitive as explicit revoke and pump termination. If the callback wins, it performs the one close-once transition; if manual revoke wins, the callback later becomes harmless through `closeOnce`.
+- `Timer.Stop() == false` does not mean callback completion and does not wait for an already-running callback. Timer callbacks hold no manager lock or timer mutex while calling CloseSession. A concurrent stop/callback has no wait cycle or deadlock.
+- The timer is installed before activation. If it fires while PENDING, it closes the pending connection and activation fails. Activation uses phase PENDING plus `!session.Closed`; there is no separate CLOSED enum.
+- Timer/revoke races have one authoritative terminal close, one channel close, and no panic/deadlock. Tests cover paused installation before publication followed by invalidation, installed timer followed by close, callback-vs-manual-close, a `Stop() == false` overlap, and a deadline already reached before install.
 
 ## 16. Session Mutation Invalidation
 
@@ -242,9 +252,9 @@ Each employee socket has exactly one timer for `min(LoginSessionExpiresAt, NextA
 | `UserService.UpdateStatus` disabling/deleting | Invalidate employee sockets immediately after the status update succeeds, before calling `RevokeByUser` |
 | `UserService.DeleteUser` | Invalidate after status/deleted_at persistence, before calling `RevokeByUser` |
 | `UserService.AssignRoles` | Register precise user invalidation after the role transaction commits and before the later `RevokeByUser` result can be returned |
-| `RoleService.UpdateStatus` | Enumerate role members before mutation; after a successful write, invalidate those employees |
-| `RoleService.AssignPermissions` | Enumerate members in the transaction and register an after-commit invalidation |
-| `PermissionService.SyncBuiltinPermissions` | Compute employees affected by changed enabled permissions and new role-permission links; register after-commit invalidation |
+| `RoleService.UpdateStatus` | Persist role status successfully, query CURRENT role members from committed state, then precisely invalidate them; a query failure uses the exceptional all-employee fail-closed fallback |
+| `RoleService.AssignPermissions` | Capture the changed role ID in the transaction and register an after-commit callback; callback queries CURRENT role members, then precisely invalidates them; query failure uses the exceptional fallback |
+| `PermissionService.SyncBuiltinPermissions` | Capture only changed permission IDs and role IDs in the transaction; after commit, resolve current role members and current direct-override users, union/deduplicate, then invalidate; resolution failure uses the exceptional fallback |
 | `OIDCLoginService.ensureDefaultOIDCRole` | When an existing employee receives the default role, register that employee for invalidation only after successful role insertion and transaction commit |
 | `UserPermissionService` direct override CRUD | Capture the previous and resulting UserID and invalidate those employee IDs only after successful persistence |
 
@@ -270,9 +280,9 @@ On rollback, the callback does not run and existing sockets remain. Fresh profil
 
 ## 19. Role and Role-Permission Mutation
 
-For `RoleService.UpdateStatus`, capture the assigned employee IDs before the single-row update. If the enumeration fails, do not mutate. After a successful status write, invalidate only those members. A no-op status update may invalidate that role's members but cannot affect other roles.
+For `RoleService.UpdateStatus`, persist the role status first. After the successful write, query CURRENT members of that role from committed state and invalidate only those users. Do not enumerate or freeze relation-derived employee IDs before the write. If a concurrent user is removed before the query, that supported membership mutation must invalidate the removed user; if added before the query, the user is included; if added after the query, the membership mutation itself invalidates that user. A no-op status update may invalidate that role's current members but cannot affect other roles. If post-write member resolution fails, record/log the error and invoke `InvalidateAllEmployees`; the committed status write is not rolled back.
 
-For `RoleService.AssignPermissions`, enumerate current employee members within the transaction and register the invalidation callback after all replacement rows have been written. Commit invokes it; rollback does not. Fresh authentication recomputes enabled role and permission sets.
+For `RoleService.AssignPermissions`, perform role-permission replacement and capture the changed role ID/impact metadata inside the transaction, then register an after-commit callback. After commit the callback queries CURRENT members of that role and invalidates them; it does not use a final employee set captured from the transaction snapshot. Rollback does not run the callback. If post-commit resolution fails, record/log the error and invoke `InvalidateAllEmployees`; the committed permission change cannot be rolled back. Fresh authentication recomputes enabled role and permission sets.
 
 `RoleService.UpdateRole` changes display metadata only in current code and does not affect authorization. `DeleteRole` refuses deletion while assigned users exist, so it has no affected live employee set. Generic `UserRoleService` and `RolePermissionService` CRUD wrappers have no current application write callsites; direct writes through them are outside the supported mutation boundary. New application writes must use `UserService.AssignRoles` or `RoleService.AssignPermissions`.
 
@@ -281,11 +291,10 @@ For `RoleService.AssignPermissions`, enumerate current employee members within t
 `PermissionService.SyncBuiltinPermissions` is the current application permission-wide write path. Within its existing transaction:
 
 1. Compare pre-write and resulting builtin permission enabled status and role-permission rows.
-2. Collect only permission IDs whose enabled state changes and role IDs receiving a newly inserted relation.
-3. Resolve affected employee IDs as the union of employee members of changed roles and employees with direct overrides for changed permission IDs.
-4. Register one after-commit invalidation callback for the deduplicated employee set.
+2. Collect only stable impact keys: permission IDs whose authorization-relevant enabled/relationship state changes and role IDs whose role-permission relation changes. Do not resolve/freeze relation-derived employee IDs as the final target set in the transaction.
+3. Register one after-commit callback carrying only those changed keys.
 
-An enumeration/query error aborts the transaction. Rollback does not invalidate. Re-running an idempotent sync with no authorization-relevant changes does not close unrelated users. Generic permission CRUD has no current handler write path; future permission writes must use the same precise affected-user calculation.
+After commit, resolve the current affected-user set from committed relationships: changed role IDs → current role members; changed permission IDs → current role-permission roles → their current members; changed permission IDs → current direct-override users. Union and deduplicate those IDs, then call `InvalidateEmployees`. A pre-commit impact-key calculation error aborts the transaction. A post-commit resolution error cannot roll back committed authorization state; record/log it and call `InvalidateAllEmployees` as the exceptional fail-closed fallback. Rollback does not invalidate. Re-running an idempotent sync with no authorization-relevant changes does not close unrelated users. Generic permission CRUD has no current handler write path; future permission writes must use the same committed-state resolution.
 
 ## 21. OIDC Default Role Mutation
 
@@ -309,11 +318,11 @@ The generic `UserRoleService` and `RolePermissionService` wrappers remain unsupp
 
 ## 23. Transaction / After-Commit Ordering
 
-Use `ctx.RegisterCallback(func() { ... })` inside `sqls.WithTransaction`, matching the existing callback mechanism and the `customer_service.go` usage. `github.com/mlogclub/simple/sqls` runs callbacks only after the DB transaction succeeds. Never call the invalidator inside the transaction body.
+Use `ctx.RegisterCallback(func() { ... })` inside `sqls.WithTransaction`, matching the existing callback mechanism and the `customer_service.go` usage. `github.com/mlogclub/simple/sqls` runs callbacks only after the DB transaction succeeds. Never call the invalidator inside the transaction body. For authorization-object mutations, the callback carries only stable changed role/permission impact keys and resolves current relation-derived employee IDs after commit. Direct-user mutations may carry their explicitly named user IDs.
 
 For single-row writes that are not transactional, persist successfully first and then invalidate synchronously. For employee disable/delete, that invalidation is deliberately between the status write and the existing bulk session-revoke write. For role assignment, the after-commit invalidation runs before the later revoke call.
 
-Rollback never invalidates. No reconnect can authenticate against uncommitted role or permission state because invalidation happens after commit.
+Rollback never invalidates. Pre-commit impact-key calculation failure aborts the mutation/transaction. A post-commit affected-user resolution failure cannot roll back the already committed authorization mutation: it must be recorded/logged and fail closed by calling `InvalidateAllEmployees`. No outbox/retry subsystem is added. No reconnect can authenticate against uncommitted role or permission state because invalidation happens after commit.
 
 ## 24. Dependency Direction and Bootstrap Wiring
 
@@ -326,7 +335,7 @@ Keep all new ports in `internal/services/employee_realtime_lifecycle.go` so muta
 - `WsConnectionManager.CloseSession` owns the one PR #4 close primitive. The lifecycle coordinator does not depend on `wsService`.
 - `AuthService` continues to validate bearer tokens and call the same independent auth snapshot helpers. It has no invalidator field.
 
-The package's existing global service style is wired once through constructor arguments with this acyclic dependency order:
+The package's existing global service style is wired once through constructor arguments with this acyclic dependency order. `employeeRealtimeLifecycle` implements all three invalidator methods in Section 10; `InvalidateAllEmployees` remains the exceptional post-commit-resolution-failure path only:
 
 ~~~text
 var employeeWSManager = newWsConnectionManager()
@@ -414,12 +423,12 @@ No test is implemented in this design stage. Future implementation uses the exis
 
 | File | Responsibility |
 | --- | --- |
-| `internal/services/employee_realtime_lifecycle_test.go` (new) | Manager scans include pending and active, exact LoginSession/user targeting, no secondary index, close count, missing/already-closed targets, and manager-lock release before close |
+| `internal/services/employee_realtime_lifecycle_test.go` (new) | Manager scans include pending and active, exact LoginSession/user targeting, exceptional all-employee fallback excludes customer/guest and does not revoke LoginSessions, no secondary index, close count, missing/already-closed targets, and manager-lock release before close |
 | `internal/services/auth_service_test.go` | Trusted metadata propagation, no raw token, exact session ID/expiry, fresh RBAC snapshot, direct override deadline and past-deadline rejection |
 | `internal/services/ws_service_test.go` | Pending has no protected topics/events, activation installs fresh principal/default topics, missing metadata and revalidation errors fail closed |
-| `internal/services/ws_session_concurrency_test.go` | Mutation-before-registration and registration-before-callback races, activation-vs-close, expiry-vs-revoke, timer cleanup, and no double channel close |
+| `internal/services/ws_session_concurrency_test.go` | Mutation-before-registration and registration-before-callback races; activation-vs-close requires registered same pointer + PENDING + !Closed; delivery requires ACTIVE + !Closed + future deadline; timer publication/close orderings, callback/manual-revoke overlap, past deadline, and no double channel close or retained timer |
 | `internal/services/login_session_service_test.go` (new) | Logout/revoke-one/revoke-all target exact sockets and occur only after successful persistence |
-| `internal/services/employee_rbac_invalidation_test.go` (new) | Disable/delete before revoke failure, assignment after commit before revoke failure, role status, role permissions, permission sync, precise impacted/unaffected employee sets, and rollback no-invalidation |
+| `internal/services/employee_rbac_invalidation_test.go` (new) | Disable/delete before revoke failure, assignment after commit before revoke failure, role status/role permissions/permission sync resolve relation-derived employees from committed state, concurrent membership and direct-override interleavings, precise impacted/unaffected employee sets, post-commit resolution failure invokes global employee fallback without touching customer sockets, and rollback no-invalidation |
 | `internal/services/user_permission_service_test.go` (new) | Create/update/column update/delete invalidates old/new direct-override owners only after successful writes |
 | `internal/services/oidc_login_service_test.go` | Existing-user default-role insertion invalidates after commit; existing role, failed insert, and rollback do not |
 
@@ -435,6 +444,15 @@ No test is implemented in this design stage. Future implementation uses the exis
 
 Tests assert no customer/support-chat reconnect behavior changes. Test names in backend must use the `TestEmployee...` / `TestWsPending...` prefixes so focused verification and the race suite can select the new behavior precisely.
 
+### Required concurrency / consistency cases
+
+- **Timer publication loses to close:** register PENDING, pause after scheduling but before the timer reference is published, invalidate/close the session, resume installation, and assert the timer is stopped and not retained and activation is rejected. Also cover the opposite ordering: publish the timer, close, and assert the reference is cleared and the timer is stopped. Use barriers around publication rather than timing sleeps.
+- **Callback and manual close overlap:** hold the timer callback at a test barrier after it starts, let manual revoke win `closeOnce`, then resume the callback and assert one authoritative terminal transition and no wait cycle. Separately verify the `Stop() == false` path does not wait for callback completion. An already-reached deadline before install leaves no timer reference and fails closed.
+- **Single terminal truth:** assert activation checks registered pointer + PENDING + `!session.Closed`, protected delivery checks ACTIVE + `!session.Closed` + future deadline, and no lifecycle enum/state transition writes CLOSED.
+- **Role membership vs status:** interleave a role membership removal/addition around a role status write and its post-write committed-state query. The result must either include the current member in the status-change invalidation or rely on that supported membership mutation's own invalidation; no stale socket can survive both.
+- **Permission mutation vs membership/direct override:** cover representative interleavings where role membership or a direct override changes around permission sync commit. Verify after-commit resolution queries current role links, current role members, and current direct-override owners, deduplicates the union, and the relation mutation independently invalidates a target changed after the query.
+- **Post-commit resolution failure:** commit an authorization mutation, force the follow-up impact resolution query to fail, and assert `InvalidateAllEmployees` closes PENDING/ACTIVE employee sockets only, does not revoke LoginSessions, and leaves customer/guest sockets untouched. Verify normal successful precise resolution never calls the fallback.
+
 ## 29. Synthetic Runtime Acceptance
 
 Use only clearly tagged synthetic employee A/B, enabled/disabled roles, permission rows, LoginSessions A/B, and a short-lived direct override. Use existing in-memory SQLite fixtures where supported, a real Gin handler, Gorilla WebSockets, actual mutation service calls, and the shared safe close primitive. Do not use production employee data or print tokens/secrets.
@@ -449,7 +467,8 @@ Required in-process acceptance:
 - A short LoginSession expiry closes an idle socket without client traffic.
 - A short direct allow expiry removes the permission on reconnect; a short direct deny expiry restores the role-derived permission on reconnect.
 - Pending activation cannot receive protected delivery. Mutation-before-registration is caught by revalidation; registration-before-callback is found and closed as PENDING.
-- Timer callback racing manual revoke produces one terminal close without panic or deadlock.
+- Timer publication racing close cannot retain a timer on a terminal session; callback racing manual revoke produces one authoritative terminal close without panic or deadlock.
+- Role/member and permission/member/direct-override interleavings resolve relation-derived targets from committed state; a forced post-commit resolution error invokes the all-employee fail-closed fallback and leaves customer sockets untouched.
 
 When executed, report the evidence as **in-process synthetic employee session/WebSocket lifecycle acceptance**. It is not production evidence or browser E2E.
 
@@ -519,13 +538,14 @@ The design is complete when implementation preserves all of the following:
 
 - trusted LoginSession ID, ExpiredAt, employee ID, principal, and next authorization deadline flow from validated server auth context; no raw token is stored;
 - post-registration authoritative revalidation checks session validity, employee status, current roles, enabled permissions, and valid overrides;
-- PENDING is registered before revalidation, has no protected delivery, and cannot activate after terminal close;
+- PENDING is registered before revalidation, has no protected delivery, and activation requires the same registered pointer, phase PENDING, and `!session.Closed`; terminal state comes only from PR #4 `Closed`, with no independent CLOSED lifecycle phase;
+- protected employee delivery requires phase ACTIVE, `!session.Closed`, and `now < LifecycleDeadline`;
 - mutation-before-registration and registration-before-callback races both fail closed;
 - exact-session revoke never closes another LoginSession; employee-wide operations close all of that employee's sockets;
 - mutations invalidate only after commit/successful persistence, with disable/delete closing before later bulk revoke can fail;
 - LoginSession expiry and direct override expiry close idle sockets through one per-socket earliest deadline;
-- timer cleanup, past deadlines, close races, and manager lock ordering are safe;
-- role/permission invalidation targets precise employee sets, including OIDC and direct override paths;
+- timer installation and terminal close are linearized by a dedicated timer-reference mutex plus the authoritative PR #4 `Closed` check; close-before-install, install-before-close, callback/manual-close overlap, `Stop() == false`, and past-deadline cases cannot retain a timer on a closed socket;
+- role/permission normal-path invalidation resolves relation-derived employee sets after commit from current DB relationships, including OIDC and direct override paths; a post-commit resolution failure is recorded and fails closed through `InvalidateAllEmployees`, which excludes customer/guest sockets and does not revoke LoginSessions;
 - frontend distinguishes invalid auth, valid profile, and transient profile failure in both reconnect paths;
 - customer/support WS, public contracts, database schema, and dependencies remain unchanged;
 - the process-local single-instance boundary and the Topics race separate finding remain explicit;
