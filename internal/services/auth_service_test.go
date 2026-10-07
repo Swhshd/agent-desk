@@ -2,6 +2,8 @@ package services
 
 import (
 	"errors"
+	"github.com/gin-gonic/gin"
+	"net/http/httptest"
 	"reflect"
 	"slices"
 	"strings"
@@ -744,5 +746,77 @@ func TestRBACFreshAuthScopeAfterRoleDisable(t *testing.T) {
 	}
 	if !slices.Equal(snapshot.Roles, roles) || !slices.Equal(snapshot.Permissions, []string{"conversation.view"}) {
 		t.Fatalf("existing snapshot mutated: roles=%v permissions=%v", snapshot.Roles, snapshot.Permissions)
+	}
+}
+
+func TestEmployeeAuthTrustedSessionMetadata(t *testing.T) {
+	db := setupAuthServiceTestDB(t)
+	grant := createRBACTestGrant(t, db, "conversation.view", enums.StatusOk, enums.StatusOk, true, nil, nil)
+	svc := newAuthService()
+	for i, token := range []string{"synthetic-session-a", "synthetic-session-b"} {
+		row := models.LoginSession{UserID: grant.UserID, Token: token, ExpiredAt: time.Now().Add(time.Duration(i+1) * time.Hour)}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest("GET", "/", nil)
+		ctx.Request.Header.Set("Authorization", "Bearer "+token)
+		if _, err := svc.Authenticate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		value, ok := svc.GetAuthenticatedEmployeeSession(ctx)
+		if !ok || value.LoginSessionID != row.ID || value.EmployeeID != row.UserID || !value.LoginSessionExpiresAt.Equal(row.ExpiredAt) {
+			t.Fatal("trusted binding missing or wrong")
+		}
+	}
+}
+func TestEmployeeAuthExpiryEqualityRejected(t *testing.T) {
+	db := setupAuthServiceTestDB(t)
+	grant := createRBACTestGrant(t, db, "conversation.view", enums.StatusOk, enums.StatusOk, true, nil, nil)
+	token := "synthetic-equality"
+	row := models.LoginSession{UserID: grant.UserID, Token: token, ExpiredAt: time.Now().Add(time.Hour)}
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	svc := newAuthService()
+	if _, err := svc.validateSessionTokenAt(token, row.ExpiredAt); err == nil {
+		t.Fatal("equal expiry accepted")
+	}
+}
+
+func TestEmployeeAuthClientIdentityIgnored(t *testing.T) {
+	db := setupAuthServiceTestDB(t)
+	grant := createRBACTestGrant(t, db, "conversation.view", enums.StatusOk, enums.StatusOk, true, nil, nil)
+	serverRow := models.LoginSession{UserID: grant.UserID, Token: "synthetic-server-binding", ExpiredAt: time.Now().Add(time.Hour)}
+	if err := db.Create(&serverRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("GET", "/?employeeId=987&loginSessionId=654&expiresAt=2099-01-01", nil)
+	ctx.Request.Header.Set("Authorization", "Bearer "+serverRow.Token)
+	ctx.Set("authenticatedEmployeeSession", authenticatedEmployeeSession{LoginSessionID: 654})
+	ctx.Request.Header.Set("X-Login-Session-ID", "654")
+	svc := newAuthService()
+	if _, err := svc.Authenticate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	value, ok := svc.GetAuthenticatedEmployeeSession(ctx)
+	if !ok {
+		t.Fatal("missing metadata")
+	}
+	if value.LoginSessionID != serverRow.ID {
+		t.Fatal("client identity overrode server binding")
+	}
+}
+func TestEmployeeAuthInjectedPrincipalHasNoMetadata(t *testing.T) {
+	ctxWithPrincipalOnly, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctxWithPrincipalOnly.Request = httptest.NewRequest("GET", "/", nil)
+	ctxWithPrincipalOnly.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: 123})
+	svc := newAuthService()
+	if _, err := svc.Authenticate(ctxWithPrincipalOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := svc.GetAuthenticatedEmployeeSession(ctxWithPrincipalOnly); ok {
+		t.Fatal("untrusted metadata manufactured")
 	}
 }
