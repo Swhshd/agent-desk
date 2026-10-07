@@ -13,10 +13,214 @@ import (
 	"time"
 
 	"agent-desk/internal/pkg/dto"
+	"agent-desk/internal/pkg/enums"
 	"agent-desk/internal/pkg/openidentity"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
+
+func TestWsPendingMutationBeforeRegistration(t *testing.T) { testWsPendingRevokeOrdering(t, true) }
+func TestWsPendingRegistrationBeforeCallback(t *testing.T) { testWsPendingRevokeOrdering(t, false) }
+
+func TestEmployeeDeliveryDeadlineAtSendLock(t *testing.T) {
+	svc := newWsServiceForTest()
+	session := &ClientSession{ID: "deadline-at-send", Role: realtimeRoleNotification, Principal: employeeViewPrincipal(), Topics: make(map[string]struct{}), Send: make(chan []byte, 64)}
+	markActiveEmployeeTestSession(session)
+	svc.manager.Register(session, []string{"notification:101"})
+	var logs wsSessionConcurrencyLogBuffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(previousLogger)
+	session.sendMu.Lock()
+	var unlock sync.Once
+	release := func() { unlock.Do(session.sendMu.Unlock) }
+	defer release()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.PublishToTopic("notification:101", RealtimeEvent{EventID: "protected-deadline-marker", Type: enums.IMRealtimeEventNotificationCreated, Data: RealtimeNotificationCreatedPayload{}})
+	}()
+	// Stack observation fences the actual post-validation enqueue lock wait;
+	// no elapsed duration is used to establish the ordering.
+	waitWsGoroutineStacks(t, "employee enqueue waiting on sendMu", func(stacks map[string]string) bool {
+		for _, stack := range stacks {
+			if strings.Contains(stack, "(*ClientSession).enqueueWithBeforeSend(") && strings.Contains(stack, "sync.(*Mutex).Lock(") {
+				return true
+			}
+		}
+		return false
+	})
+	session.LifecycleDeadline = time.Now()
+	release()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadline enqueue did not finish after lock release")
+	}
+	if len(session.Send) != 0 {
+		t.Fatal("protected output crossed deadline while waiting for sendMu")
+	}
+	if !session.Closed.Load() || svc.manager.Count() != 0 {
+		t.Fatal("expired enqueue did not close outside sendMu")
+	}
+	svc.closeSession(session)
+	if logs.count([]byte(`"connId":"deadline-at-send"`)) != 1 {
+		t.Fatal("expired enqueue did not close exactly once")
+	}
+}
+
+func TestEmployeeDeliveryDeadlineAtSubscriptionLock(t *testing.T) {
+	svc := newWsServiceForTest()
+	session := &ClientSession{ID: "deadline-at-subscribe", Role: realtimeRoleAdmin, Principal: employeeViewPrincipal(), Topics: make(map[string]struct{}), Send: make(chan []byte, 64)}
+	markActiveEmployeeTestSession(session)
+	svc.manager.Register(session, nil)
+	var logs wsSessionConcurrencyLogBuffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(previousLogger)
+	svc.manager.mu.Lock()
+	var unlock sync.Once
+	release := func() { unlock.Do(svc.manager.mu.Unlock) }
+	defer release()
+	done := make(chan []string, 1)
+	go func() { done <- svc.subscribeTopics(session, []string{"conversation:42"}) }()
+	waitWsGoroutineStacks(t, "employee subscription waiting on manager.mu", func(stacks map[string]string) bool {
+		for _, stack := range stacks {
+			if strings.Contains(stack, "(*WsConnectionManager).Subscribe(") && strings.Contains(stack, "sync.(*RWMutex).Lock(") {
+				return true
+			}
+		}
+		return false
+	})
+	session.sendMu.Lock()
+	session.LifecycleDeadline = time.Now()
+	session.sendMu.Unlock()
+	release()
+	select {
+	case topics := <-done:
+		if len(topics) != 0 {
+			t.Fatalf("expired subscription acknowledged %v", topics)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expired admission deadlocked closing with manager.mu held")
+	}
+	if svc.manager.HasTopic("conversation:42") || len(session.Topics) != 0 {
+		t.Fatal("expired membership inserted after manager lock wait")
+	}
+	if !session.Closed.Load() || svc.manager.Count() != 0 {
+		t.Fatal("expired admission did not close after releasing manager.mu")
+	}
+	svc.closeSession(session)
+	if logs.count([]byte(`"connId":"deadline-at-subscribe"`)) != 1 {
+		t.Fatal("expired admission did not close exactly once")
+	}
+}
+
+func testWsPendingRevokeOrdering(t *testing.T, revokeBeforeRegistration bool) {
+	db := lifecycleAuthTestDB(t)
+	grant := createRBACTestGrant(t, db, "conversation.view", enums.StatusOk, enums.StatusOk, true, nil, nil)
+	row := seedEmployeeSnapshotSession(t, db, grant.UserID, time.Now())
+	initial, err := (employeeAuthStateReader{}).ReadEmployeeSession(row.ID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := newWsServiceForTest()
+	lifecycle := svc.lifecycle.(*employeeWsTestLifecycle)
+	lifecycle.readCurrent = lifecycle.employeeRealtimeLifecycle.RevalidateEmployeeSession
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	lifecycle.beforeRead = func(id int64) {
+		if id != row.ID {
+			t.Errorf("revalidated wrong login ID %d", id)
+		}
+		close(entered)
+		<-release
+	}
+	revoke := func() {
+		if err := db.Model(&row).Update("revoked_at", time.Now()).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	peer, done := openPendingTestSocket(t, svc, realtimeRoleAdmin, func(ctx *gin.Context) {
+		ctx.Set(authPrincipalContextKey, initial.Principal)
+		AuthService.setAuthenticatedEmployeeSession(ctx, authenticatedEmployeeSession{EmployeeID: initial.EmployeeID, LoginSessionID: initial.LoginSessionID, LoginSessionExpiresAt: initial.LoginSessionExpiresAt, Principal: initial.Principal})
+		if revokeBeforeRegistration {
+			revoke()
+			if n := lifecycle.InvalidateLoginSession(row.ID); n != 0 {
+				t.Errorf("pre-registration scan closed %d sessions", n)
+			}
+		}
+	})
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("revalidator barrier never reached")
+	}
+	session := pendingTestSession(t, svc)
+	assertPendingConfidentiality(t, svc, session)
+	if !revokeBeforeRegistration {
+		revoke()
+		if n := lifecycle.InvalidateLoginSession(row.ID); n != 1 {
+			t.Fatalf("pending callback closed %d", n)
+		}
+	}
+	unblock()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("revoked pending upgrade accepted")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("revoked upgrade did not finish")
+	}
+	if employeeLifecyclePhase(session.employeePhase.Load()) == employeePhaseActive || svc.manager.HasTopic("admin:all") || !session.Closed.Load() || len(session.Send) != 0 {
+		t.Fatal("pending session was resurrected")
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, body, err := peer.ReadMessage(); err == nil {
+		t.Fatalf("frame escaped revoked pending socket: %s", body)
+	} else {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatal("revoked peer did not close")
+		}
+	}
+}
+
+func TestWsPendingActivationAfterCloseRejected(t *testing.T) {
+	svc := newWsServiceForTest()
+	lifecycle := svc.lifecycle.(*employeeWsTestLifecycle)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	lifecycle.beforeRead = func(int64) { close(entered); <-release }
+	_, done := openPendingTestSocket(t, svc, realtimeRoleNotification, nil)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("revalidator never invoked")
+	}
+	session := pendingTestSession(t, svc)
+	assertPendingConfidentiality(t, svc, session)
+	if lifecycle.InvalidateLoginSession(session.LoginSessionID) != 1 {
+		t.Fatal("pending session absent from invalidation scan")
+	}
+	unblock()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("closed pending upgrade accepted")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed upgrade did not finish")
+	}
+	if _, activated := svc.manager.Activate(session, lifecycleTestSnapshot(101, 1000101), []string{"notification:101"}); activated || svc.manager.HasTopic("notification:101") || !session.Closed.Load() {
+		t.Fatal("pending session was resurrected")
+	}
+}
 
 func TestWsSessionNormalDelivery(t *testing.T) {
 	service, peer, session := newWsPumpTestSocket(t)
@@ -103,7 +307,7 @@ func TestWsSessionCloseAcrossHandlerRoles(t *testing.T) {
 			// Keep role cases serial: the only new pump pair must belong to this
 			// one handler connection. Ambiguous observations fail the test.
 			before := waitWsGoroutineStacks(t, "initial snapshot", func(map[string]string) bool { return true })
-			service := newWsService()
+			service := newWsServiceForTest()
 			peer := tc.open(t, service)
 			if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				t.Fatal(err)
@@ -171,14 +375,14 @@ func TestWsSessionCloseAcrossHandlerRoles(t *testing.T) {
 }
 
 func TestWsSessionCloseSyntheticRuntime(t *testing.T) {
-	service := newWsService()
+	service := newWsServiceForTest()
 	router := gin.New()
 	router.GET("/target", func(ctx *gin.Context) {
-		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: 101})
+		bindEmployeeWsTestSession(t, service, ctx, &dto.AuthPrincipal{UserID: 101})
 		service.HandleDashboardNotificationWS(ctx)
 	})
 	router.GET("/unaffected", func(ctx *gin.Context) {
-		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: 102})
+		bindEmployeeWsTestSession(t, service, ctx, &dto.AuthPrincipal{UserID: 102})
 		service.HandleDashboardNotificationWS(ctx)
 	})
 	server := httptest.NewServer(router)
@@ -338,7 +542,7 @@ func TestWsSessionCloseSyntheticRuntime(t *testing.T) {
 
 func newWsPumpTestSocket(t *testing.T) (*wsService, *websocket.Conn, *ClientSession) {
 	t.Helper()
-	service := newWsService()
+	service := newWsServiceForTest()
 	sessions := make(chan *ClientSession, 1)
 	router := gin.New()
 	router.GET("/ws", func(ctx *gin.Context) {
@@ -369,7 +573,7 @@ func openWsDashboardPumpTestSocket(t *testing.T, service *wsService, userID int6
 	t.Helper()
 	router := gin.New()
 	router.GET("/ws", func(ctx *gin.Context) {
-		ctx.Set(authPrincipalContextKey, &dto.AuthPrincipal{UserID: userID})
+		bindEmployeeWsTestSession(t, service, ctx, &dto.AuthPrincipal{UserID: userID})
 		handler(ctx)
 	})
 	server := httptest.NewServer(router)
@@ -504,7 +708,7 @@ func TestClientSessionEnqueueCharacterization(t *testing.T) {
 }
 
 func TestClientSessionEnqueueCloseLinearization(t *testing.T) {
-	service := newWsService()
+	service := newWsServiceForTest()
 	session := &ClientSession{Send: make(chan []byte, 1)}
 	observedOpen := make(chan struct{})
 	resume := make(chan struct{})
@@ -699,7 +903,7 @@ func TestWsSessionCloseRejectsStaleOperations(t *testing.T) {
 }
 
 func TestWsSessionSubscribeBeforeCloseIsUnregistered(t *testing.T) {
-	service := newWsService()
+	service := newWsServiceForTest()
 	session := &ClientSession{
 		ID:     "subscribe-before-close",
 		Topics: make(map[string]struct{}),
@@ -719,7 +923,7 @@ func TestWsSessionSubscribeBeforeCloseIsUnregistered(t *testing.T) {
 }
 
 func newWsSessionConcurrencyFixture(id string) (*wsService, *ClientSession, string) {
-	service := newWsService()
+	service := newWsServiceForTest()
 	session := &ClientSession{
 		ID:     id,
 		Topics: make(map[string]struct{}),

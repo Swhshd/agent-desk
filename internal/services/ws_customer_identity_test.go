@@ -19,7 +19,7 @@ import (
 )
 
 func TestCustomerDefaultTopicsUseVerifiedCustomerID(t *testing.T) {
-	svc := newWsService()
+	svc := newWsServiceForTest()
 	external := &openidentity.ExternalUser{ExternalID: "collision-id"}
 	for _, tc := range []struct {
 		name    string
@@ -43,7 +43,7 @@ func TestCustomerDefaultTopicsUseVerifiedCustomerID(t *testing.T) {
 func TestCustomerRealtimeSubscriptionAdmission(t *testing.T) {
 	for _, topic := range []string{"customer:41", "customer:42", "customer:", "customer:0", "customer:-1", "customer:not-a-number"} {
 		t.Run(topic, func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			conn := openCustomerIdentityTestSocket(t, svc, 41, &openidentity.ExternalUser{ExternalID: "collision-id"})
 			readCustomerIdentityTestEvent(t, conn, enums.IMRealtimeEventConnected)
 			if err := conn.WriteJSON(map[string]any{"type": "subscribe", "topics": []string{topic, topic}}); err != nil {
@@ -113,7 +113,7 @@ func TestCustomerConversationSubscriptionOwnership(t *testing.T) {
 		{"negative cannot own A", -1, 501, "conversation:501", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := newWsService()
+			svc := newWsServiceForTest()
 			// No identity mappings exist: external source/ID cannot provide authority.
 			external := &openidentity.ExternalUser{ExternalID: "synthetic-unmapped-owner", ExternalSource: enums.ExternalSourceGuest}
 			if got := svc.canSubscribeConversation(&ClientSession{Role: realtimeRoleUser, CustomerID: tc.customerID, External: external}, tc.conversationID); got != tc.allowed {

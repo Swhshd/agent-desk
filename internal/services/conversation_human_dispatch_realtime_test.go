@@ -160,6 +160,7 @@ func captureHumanDispatchRealtimeSession(t *testing.T, topics ...string) *Client
 		Topics:    map[string]struct{}{},
 		Send:      make(chan []byte, 32),
 	}
+	markActiveEmployeeTestSession(session)
 	manager := WsService.manager
 	manager.Register(session, topics)
 	t.Cleanup(func() { manager.Unregister(session) })

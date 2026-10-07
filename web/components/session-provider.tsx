@@ -11,12 +11,14 @@ import {
   writeSession,
   type AuthSession,
 } from "@/lib/auth"
+import type { RealtimeProfileResult } from "@/lib/realtime-connection"
 
 type SessionContextValue = {
   session: AuthSession | null
   ready: boolean
   signingOut: boolean
   refreshSession: () => Promise<void>
+  validateRealtimeProfile: () => Promise<RealtimeProfileResult>
   signOut: () => Promise<void>
 }
 
@@ -27,12 +29,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false)
   const [signingOut, setSigningOut] = useState(false)
 
-  const refreshSession = useCallback(async () => {
+  const validateRealtimeProfile = useCallback(async () => {
     const stored = readSession()
     if (!stored) {
       setSession(null)
       setReady(true)
-      return
+      return "invalid" as const
     }
 
     try {
@@ -47,18 +49,25 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       }
       writeSession(nextSession)
       setSession(nextSession)
+      return "valid" as const
     } catch (error) {
       const errorCode = (error as Error & { errorCode?: number }).errorCode
       if (errorCode === 3000 || errorCode === 3002) {
         clearSession()
         setSession(null)
+        return "invalid" as const
       } else {
         setSession(stored)
+        return "transient" as const
       }
     } finally {
       setReady(true)
     }
   }, [])
+
+  const refreshSession = useCallback(async () => {
+    await validateRealtimeProfile()
+  }, [validateRealtimeProfile])
 
   const signOut = useCallback(async () => {
     if (signingOut) return
@@ -97,7 +106,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <SessionContext.Provider value={{ session, ready, signingOut, refreshSession, signOut }}>
+    <SessionContext.Provider value={{ session, ready, signingOut, refreshSession, validateRealtimeProfile, signOut }}>
       {children}
     </SessionContext.Provider>
   )

@@ -11,11 +11,12 @@ import (
 	"agent-desk/internal/pkg/errorsx"
 	"agent-desk/internal/pkg/utils"
 	"agent-desk/internal/repositories"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/mail"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -39,6 +40,30 @@ func newAuthService() *authService {
 type authService struct {
 }
 
+type authenticatedEmployeeSession struct {
+	EmployeeID            int64
+	LoginSessionID        int64
+	LoginSessionExpiresAt time.Time
+	Principal             *dto.AuthPrincipal
+	NextAuthzChangeAt     *time.Time
+}
+type authenticatedEmployeeSessionContextKey struct{}
+
+func (s *authService) GetAuthenticatedEmployeeSession(ctx *gin.Context) (*authenticatedEmployeeSession, bool) {
+	if ctx == nil || ctx.Request == nil {
+		return nil, false
+	}
+	value, ok := ctx.Request.Context().Value(authenticatedEmployeeSessionContextKey{}).(authenticatedEmployeeSession)
+	if !ok {
+		return nil, false
+	}
+	return &value, true
+}
+
+func (s *authService) setAuthenticatedEmployeeSession(ctx *gin.Context, value authenticatedEmployeeSession) {
+	ctx.Request = ctx.Request.WithContext(context.WithValue(ctx.Request.Context(), authenticatedEmployeeSessionContextKey{}, value))
+}
+
 func (s *authService) GetAuthPrincipal(ctx *gin.Context) *dto.AuthPrincipal {
 	if ctx == nil {
 		return nil
@@ -51,16 +76,7 @@ func (s *authService) GetAuthPrincipal(ctx *gin.Context) *dto.AuthPrincipal {
 }
 
 func (s *authService) setAuthPrincipal(ctx *gin.Context, user *models.User, roles, permissions []string) *dto.AuthPrincipal {
-	principal := &dto.AuthPrincipal{
-		UserID:      user.ID,
-		Username:    user.Username,
-		Nickname:    user.Nickname,
-		Avatar:      user.Avatar,
-		UserType:    user.UserType,
-		Status:      user.Status,
-		Roles:       roles,
-		Permissions: permissions,
-	}
+	principal := employeeAuthPrincipal(user, roles, permissions)
 	ctx.Set(authPrincipalContextKey, principal)
 	return principal
 }
@@ -132,15 +148,13 @@ func (s *authService) Login(req request.LoginRequest, authCfg config.AuthConfig,
 
 func (s *authService) Logout(accessToken string) error {
 	accessToken = s.extractBearerToken(accessToken)
-	now := time.Now()
 	if accessToken != "" {
 		if session := LoginSessionService.FindOne(sqls.NewCnd().Eq("token", accessToken)); session != nil && session.RevokedAt == nil {
-			if err := LoginSessionService.Updates(session.ID, map[string]any{
-				"revoked_at": now,
-				"updated_at": now,
-			}); err != nil {
-				return err
+			username := ""
+			if user := UserService.Get(session.UserID); user != nil {
+				username = user.Username
 			}
+			return LoginSessionService.Revoke(session.ID, session.UserID, username)
 		}
 	}
 	return nil
@@ -159,23 +173,29 @@ func (s *authService) Authenticate(ctx *gin.Context) (*dto.AuthPrincipal, error)
 		return nil, errorsx.UnauthorizedI18n("error.auth.expired")
 	}
 
-	session, err := s.validateSessionToken(token)
+	now := time.Now()
+	session, err := s.validateSessionTokenAt(token, now)
 	if err != nil {
 		return nil, err
 	}
 
-	user := UserService.Get(session.UserID)
-	if user == nil || user.Status != enums.StatusOk {
+	user, err := repositories.EmployeeAuthRepository.UserByID(sqls.DB(), session.UserID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, errorsx.UnauthorizedI18n("error.e0256")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if user.Status != enums.StatusOk || user.DeletedAt != nil {
 		return nil, errorsx.UnauthorizedI18n("error.e0256")
 	}
 
-	roles, permissions, err := s.loadUserAuthScope(sqls.DB(), user.ID)
+	roles, permissions, nextAuthzChangeAt, err := loadEmployeeAuthScope(sqls.DB(), user.ID, now)
 	if err != nil {
 		return nil, err
 	}
 	principal := s.setAuthPrincipal(ctx, user, roles, permissions)
-
-	now := time.Now()
+	s.setAuthenticatedEmployeeSession(ctx, authenticatedEmployeeSession{EmployeeID: user.ID, LoginSessionID: session.ID, LoginSessionExpiresAt: session.ExpiredAt, Principal: principal, NextAuthzChangeAt: nextAuthzChangeAt})
 	_ = LoginSessionService.Updates(session.ID, map[string]any{
 		"last_seen_at": now,
 		"updated_at":   now,
@@ -331,6 +351,10 @@ func (s *authService) resolveTokenTTL(authCfg config.AuthConfig) time.Duration {
 }
 
 func (s *authService) validateSessionToken(token string) (*models.LoginSession, error) {
+	return s.validateSessionTokenAt(token, time.Now())
+}
+
+func (s *authService) validateSessionTokenAt(token string, now time.Time) (*models.LoginSession, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errorsx.UnauthorizedI18n("error.auth.expired")
 	}
@@ -341,22 +365,15 @@ func (s *authService) validateSessionToken(token string) (*models.LoginSession, 
 	if session.RevokedAt != nil {
 		return nil, errorsx.InvalidTokenI18n("error.e0267")
 	}
-	if time.Now().After(session.ExpiredAt) {
+	if !now.Before(session.ExpiredAt) {
 		return nil, errorsx.InvalidTokenI18n("error.e0268")
 	}
 	return session, nil
 }
 
 func (s *authService) loadUserAuthScope(tx *gorm.DB, userID int64) ([]string, []string, error) {
-	roleCodes, err := s.loadUserRoleCodes(tx, userID)
-	if err != nil {
-		return nil, nil, err
-	}
-	permissionCodes, err := s.loadUserPermissionCodes(tx, userID)
-	if err != nil {
-		return nil, nil, err
-	}
-	return roleCodes, permissionCodes, nil
+	roles, permissions, _, err := loadEmployeeAuthScope(tx, userID, time.Now())
+	return roles, permissions, err
 }
 
 func (s *authService) loadUserRoleCodes(tx *gorm.DB, userID int64) ([]string, error) {
@@ -372,80 +389,22 @@ func (s *authService) loadUserRoleCodes(tx *gorm.DB, userID int64) ([]string, er
 }
 
 func (s *authService) loadUserRoles(tx *gorm.DB, userID int64) ([]models.Role, error) {
-	roles := make([]models.Role, 0)
-	if err := tx.
-		Table("t_role AS r").
-		Select("r.*").
-		Joins("JOIN t_user_role AS ur ON ur.role_id = r.id").
-		Where("ur.user_id = ? AND r.status = ?", userID, enums.StatusOk).
-		Order("r.sort_no ASC, r.id ASC").
-		Scan(&roles).Error; err != nil {
-		return nil, err
-	}
-
-	return roles, nil
+	return repositories.EmployeeAuthRepository.UserRoles(tx, userID)
 }
 
-type userPermissionOverride struct {
-	Code   string
-	Effect int
-}
+type userPermissionOverride = repositories.EmployeeAuthOverride
 
 func rolePermissionCodesQuery(tx *gorm.DB, userID int64) *gorm.DB {
-	return tx.Table("t_permission AS p").
-		Select("DISTINCT p.code").
-		Joins("JOIN t_role_permission AS rp ON rp.permission_id = p.id").
-		Joins("JOIN t_user_role AS ur ON ur.role_id = rp.role_id").
-		Joins("JOIN t_role AS r ON r.id = rp.role_id").
-		Where("ur.user_id = ?", userID).
-		Where("p.status = ?", enums.StatusOk).
-		Where("r.status = ?", enums.StatusOk)
+	return repositories.EmployeeAuthRepository.RolePermissionCodesQuery(tx, userID)
 }
 
 func activeUserPermissionOverridesQuery(tx *gorm.DB, userID int64, now time.Time) *gorm.DB {
-	return tx.Table("t_user_permission AS up").
-		Select("p.code, up.effect").
-		Joins("JOIN t_permission AS p ON p.id = up.permission_id").
-		Where("up.user_id = ? AND (up.expired_at IS NULL OR up.expired_at > ?)", userID, now).
-		Where("p.status = ?", enums.StatusOk)
+	return repositories.EmployeeAuthRepository.ActiveOverridesQuery(tx, userID, now)
 }
 
 func (s *authService) loadUserPermissionCodes(tx *gorm.DB, userID int64) ([]string, error) {
-	permissionRows := make([]struct {
-		Code string
-	}, 0)
-	if err := rolePermissionCodesQuery(tx, userID).Scan(&permissionRows).Error; err != nil {
-		return nil, err
-	}
-
-	permissionCodes := make([]string, 0, len(permissionRows))
-	for _, permission := range permissionRows {
-		permissionCodes = append(permissionCodes, permission.Code)
-	}
-
-	overrideRows := make([]userPermissionOverride, 0)
-	if err := activeUserPermissionOverridesQuery(tx, userID, time.Now()).Scan(&overrideRows).Error; err != nil {
-		return nil, err
-	}
-
-	permissionSet := make(map[string]bool, len(permissionCodes))
-	for _, code := range permissionCodes {
-		permissionSet[code] = true
-	}
-	for _, override := range overrideRows {
-		if override.Effect < 0 {
-			delete(permissionSet, override.Code)
-			continue
-		}
-		permissionSet[override.Code] = true
-	}
-
-	permissionCodes = permissionCodes[:0]
-	for code := range permissionSet {
-		permissionCodes = append(permissionCodes, code)
-	}
-	sort.Strings(permissionCodes)
-	return permissionCodes, nil
+	codes, _, err := loadEmployeePermissionCodes(tx, userID, time.Now())
+	return codes, err
 }
 
 func (s *authService) extractBearerToken(header string) string {

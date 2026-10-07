@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react"
 import { toast } from "sonner"
+import { useAuth } from "@/components/auth-provider"
 
 import { createAdminWebSocketUrl } from "@/lib/api/admin"
 import {
@@ -30,6 +31,7 @@ type AgentRealtimeEnvelope = {
 }
 
 export function useAgentConversationRealtime() {
+  const { validateRealtimeProfile } = useAuth()
   const t = useI18n()
   const selectedConversationId = useAgentConversationsStore(
     (state) => state.selectedConversationId
@@ -41,14 +43,20 @@ export function useAgentConversationRealtime() {
   const subscribedConversationIdRef = useRef<number | null>(null)
   const selectedConversationIdRef = useRef<number | null>(selectedConversationId)
   const currentUserIdRef = useRef<number>(readSession()?.user.id ?? 0)
+  const validateRealtimeProfileRef = useRef(validateRealtimeProfile)
 
   useEffect(() => {
     selectedConversationIdRef.current = selectedConversationId
   }, [selectedConversationId])
 
   useEffect(() => {
+    validateRealtimeProfileRef.current = validateRealtimeProfile
+  }, [validateRealtimeProfile])
+
+  useEffect(() => {
     const realtime = createRealtimeConnectionManager({
       createSocket: () => new WebSocket(createAdminWebSocketUrl()),
+      beforeReconnect: () => validateRealtimeProfileRef.current(),
       onStatusChange: setRealtimeStatus,
       onOpen: (socket) => {
         console.info("[agent-realtime] websocket connected", {

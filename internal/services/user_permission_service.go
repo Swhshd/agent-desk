@@ -1,21 +1,27 @@
 package services
 
 import (
+	"errors"
+	"log/slog"
+	"slices"
+
 	"agent-desk/internal/models"
 	"agent-desk/internal/repositories"
 
 	"agent-desk/internal/pkg/httpx/params"
 
 	"github.com/mlogclub/simple/sqls"
+	"gorm.io/gorm"
 )
 
-var UserPermissionService = newUserPermissionService()
+var UserPermissionService = newUserPermissionService(employeeRealtime)
 
-func newUserPermissionService() *userPermissionService {
-	return &userPermissionService{}
+func newUserPermissionService(invalidator EmployeeRealtimeInvalidator) *userPermissionService {
+	return &userPermissionService{invalidator: invalidator}
 }
 
 type userPermissionService struct {
+	invalidator EmployeeRealtimeInvalidator
 }
 
 func (s *userPermissionService) Get(id int64) *models.UserPermission {
@@ -47,21 +53,136 @@ func (s *userPermissionService) Count(cnd *sqls.Cnd) int64 {
 }
 
 func (s *userPermissionService) Create(t *models.UserPermission) error {
-	return repositories.UserPermissionRepository.Create(sqls.DB(), t)
+	if err := repositories.UserPermissionRepository.Create(sqls.DB(), t); err != nil {
+		return err
+	}
+	if t != nil && t.ID > 0 {
+		s.invalidateOwners(t.UserID)
+	}
+	return nil
 }
 
 func (s *userPermissionService) Update(t *models.UserPermission) error {
-	return repositories.UserPermissionRepository.Update(sqls.DB(), t)
+	db := sqls.DB()
+	var old *models.UserPermission
+	if t != nil && t.ID > 0 {
+		var err error
+		old, err = checkedUserPermission(db, t.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if err := repositories.UserPermissionRepository.Update(db, t); err != nil {
+		return err
+	}
+	ids := make([]int64, 0, 2)
+	if old != nil {
+		ids = append(ids, old.UserID)
+	}
+	if t != nil && t.ID > 0 {
+		updated, err := repositories.UserPermissionRepository.GetChecked(db, t.ID)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			s.invalidateAllAfterReloadError("user permission update", err)
+			return nil
+		}
+		if updated != nil {
+			ids = append(ids, updated.UserID)
+		}
+	}
+	s.invalidateOwners(ids...)
+	return nil
 }
 
 func (s *userPermissionService) Updates(id int64, columns map[string]interface{}) error {
-	return repositories.UserPermissionRepository.Updates(sqls.DB(), id, columns)
+	db := sqls.DB()
+	old, err := checkedUserPermission(db, id)
+	if err != nil {
+		return err
+	}
+	if err := repositories.UserPermissionRepository.Updates(db, id, columns); err != nil {
+		return err
+	}
+	if old == nil {
+		return nil
+	}
+	updated, err := repositories.UserPermissionRepository.GetChecked(db, id)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		s.invalidateAllAfterReloadError("user permission updates", err)
+		return nil
+	}
+	ids := []int64{old.UserID}
+	if updated != nil {
+		ids = append(ids, updated.UserID)
+	}
+	s.invalidateOwners(ids...)
+	return nil
 }
 
 func (s *userPermissionService) UpdateColumn(id int64, name string, value interface{}) error {
-	return repositories.UserPermissionRepository.UpdateColumn(sqls.DB(), id, name, value)
+	db := sqls.DB()
+	old, err := checkedUserPermission(db, id)
+	if err != nil {
+		return err
+	}
+	if err := repositories.UserPermissionRepository.UpdateColumn(db, id, name, value); err != nil {
+		return err
+	}
+	if old == nil {
+		return nil
+	}
+	updated, err := repositories.UserPermissionRepository.GetChecked(db, id)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		s.invalidateAllAfterReloadError("user permission update column", err)
+		return nil
+	}
+	ids := []int64{old.UserID}
+	if updated != nil {
+		ids = append(ids, updated.UserID)
+	}
+	s.invalidateOwners(ids...)
+	return nil
 }
 
-func (s *userPermissionService) Delete(id int64) {
-	repositories.UserPermissionRepository.Delete(sqls.DB(), id)
+func (s *userPermissionService) Delete(id int64) error {
+	db := sqls.DB()
+	old, err := checkedUserPermission(db, id)
+	if err != nil {
+		return err
+	}
+	if err := repositories.UserPermissionRepository.Delete(db, id); err != nil {
+		return err
+	}
+	if old != nil {
+		s.invalidateOwners(old.UserID)
+	}
+	return nil
+}
+
+func checkedUserPermission(db *gorm.DB, id int64) (*models.UserPermission, error) {
+	row, err := repositories.UserPermissionRepository.GetChecked(db, id)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return row, err
+}
+
+func (s *userPermissionService) invalidateOwners(ids ...int64) {
+	if s.invalidator == nil {
+		panic("employee realtime invalidator is required")
+	}
+	ids = slices.DeleteFunc(ids, func(id int64) bool { return id <= 0 })
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	if len(ids) > 0 {
+		s.invalidator.InvalidateEmployees(ids)
+	}
+}
+
+func (s *userPermissionService) invalidateAllAfterReloadError(mutation string, err error) {
+	slog.Error("employee authorization impact resolution failed after user permission write", "mutation", mutation, "error", err)
+	if s.invalidator != nil {
+		s.invalidator.InvalidateAllEmployees()
+		return
+	}
+	panic("employee realtime invalidator is required")
 }
