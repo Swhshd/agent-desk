@@ -357,6 +357,10 @@ export const useSupportChatStore = create<SupportChatStore>((set, get) => {
             departCustomerSessionIdentity()
             resetCustomerState(null, widgetConfig.channelId)
             attempt = beginCustomerSessionBootstrap()
+          } else if (isCustomerSessionContinuityLost()) {
+            // Proof can disappear or expire while widget configuration is pending.
+            departCustomerSessionIdentity()
+            resetCustomerState(null, readSupportChatRuntimeConfig().channelId || "")
           }
 
           set({

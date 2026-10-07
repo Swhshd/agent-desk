@@ -251,6 +251,53 @@ test("unexpected different customer advances epoch once and atomically installs 
   await h.flush()
 })
 
+test("proof disappearing during widget config clears A before fresh exchange and rejection", async () => {
+  const widgetPending = deferred(), exchangePending = deferred()
+  let deferWidget = false, dispatchState = null, dispatchScopeCurrent = true
+  const h = await initializedA({
+    widget: async () => deferWidget ? widgetPending.promise : presentation,
+    exchange: async () => {
+      dispatchState = h.store.getState()
+      dispatchScopeCurrent = h.scope.isCustomerSessionScopeCurrent(oldScope)
+      return exchangePending.promise
+    },
+  })
+  const oldScope = h.scope.captureCustomerSessionScope(), oldSocket = h.store.getState().socket
+  oldSocket.emit("open")
+  deferWidget = true
+  h.store.getState().bootstrap()
+  await h.flush()
+  assert.equal(h.store.getState().conversation.id, 901, "A remains valid while widget config waits")
+  assert.equal(h.scope.isCustomerSessionScopeCurrent(oldScope), true)
+  assert.ok(h.store.getState().socket === oldSocket)
+  assert.equal(h.requests.filter((item) => item.path === "/api/customer/session_exchange").length, 0)
+  writeSession(h, null)
+  widgetPending.resolve(presentation)
+  await h.flush()
+  assert.ok(dispatchState, "fresh exchange was dispatched")
+  assert.equal(dispatchState.conversation, null, "A transcript must be cleared before proofless exchange dispatch")
+  assert.equal(dispatchState.messages.length, 0)
+  assert.equal(dispatchState.customer, null)
+  assert.equal(dispatchState.socket, null)
+  assert.equal(dispatchScopeCurrent, false)
+  assertDeparted(h, oldScope, oldSocket)
+  const exchanges = h.requests.filter((item) => item.path === "/api/customer/session_exchange")
+  assert.equal(exchanges.length, 1)
+  assert.equal("X-Customer-Session-Token" in exchanges[0].options.headers, false)
+  exchangePending.reject(new Error("fresh bootstrap rejected"))
+  await h.flush()
+  const state = h.store.getState()
+  assert.equal(state.customer, null)
+  assert.equal(state.conversation, null)
+  assert.equal(state.messages.length, 0)
+  assert.equal(state.socket, null)
+  assert.equal(state.initialized, false)
+  assert.equal(state.status, "disconnected")
+  assert.equal(state.error, "supportChat.initFailed")
+  assert.equal(h.scope.isCustomerSessionScopeCurrent(oldScope), false)
+  assert.equal(h.requests.filter((item) => item.path === "/api/customer/session_exchange").length, 1)
+})
+
 test("matching still-unexpired proof rejection performs one exchange without fresh fallback", async () => {
   const h = await initializedA({ exchange: async () => { throw new Error("presented proof rejected") } })
   const before = h.store.getState(), oldScope = h.scope.captureCustomerSessionScope()
