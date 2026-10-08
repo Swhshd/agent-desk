@@ -10,8 +10,33 @@ import (
 )
 
 const (
-	ctxKeyExternalUser = "externalUser"
+	ctxKeyExternalUser       = "externalUser"
+	ctxKeyVerifiedCustomerID = "verifiedCustomerID"
 )
+
+// SetVerifiedCustomerID retains only a positive ID established by authentication.
+func SetVerifiedCustomerID(ctx *gin.Context, customerID int64) {
+	if ctx == nil {
+		return
+	}
+	if customerID <= 0 {
+		customerID = 0
+	}
+	ctx.Set(ctxKeyVerifiedCustomerID, customerID)
+}
+
+// GetVerifiedCustomerID never resolves authority from request parameters or headers.
+func GetVerifiedCustomerID(ctx *gin.Context) int64 {
+	if ctx == nil {
+		return 0
+	}
+	value, exists := ctx.Get(ctxKeyVerifiedCustomerID)
+	customerID, valid := value.(int64)
+	if !exists || !valid || customerID <= 0 {
+		return 0
+	}
+	return customerID
+}
 
 func SetExternalUser(ctx *gin.Context, ext *openidentity.ExternalUser) {
 	ctx.Set(ctxKeyExternalUser, ext)

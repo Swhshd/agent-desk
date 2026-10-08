@@ -376,6 +376,19 @@ func (s *messageService) SendCustomerMessageWithRequestID(conversationID int64, 
 	return s.sendMessage(conversationID, enums.IMSenderTypeCustomer, 0, clientMsgID, messageType, content, payload, nil, &ext, requestID, 0)
 }
 
+// SendVerifiedCustomerMessageWithRequestID consumes the server-verified customer
+// ID; external identity remains display and reader metadata only.
+func (s *messageService) SendVerifiedCustomerMessageWithRequestID(conversationID, customerID int64, clientMsgID string, messageType enums.IMMessageType, content, payload string, external openidentity.ExternalUser, requestID string) (*models.Message, error) {
+	conversation, err := s.ValidateVerifiedCustomerSender(conversationID, customerID, &external)
+	if err != nil {
+		return nil, err
+	}
+	if strs.IsBlank(string(messageType)) {
+		messageType = enums.IMMessageTypeText
+	}
+	return s.sendValidatedMessage(conversation, enums.IMSenderTypeCustomer, 0, clientMsgID, messageType, content, payload, nil, &external, requestID, 0)
+}
+
 func (s *messageService) sendMessage(conversationID int64, senderType enums.IMSenderType, reqSenderID int64, clientMsgID string,
 	messageType enums.IMMessageType, content, payload string, operator *dto.AuthPrincipal, external *openidentity.ExternalUser, requestID string, workflowRunID int64) (*models.Message, error) {
 
@@ -699,6 +712,23 @@ func (s *messageService) normalizeMessageContent(conversationID int64, messageTy
 		}
 		return content, strings.TrimSpace(payload), buildMessageSummary(messageType, content), nil
 	}
+}
+
+func (s *messageService) ValidateVerifiedCustomerSender(conversationID, customerID int64, external *openidentity.ExternalUser) (*models.Conversation, error) {
+	if customerID <= 0 || external == nil || strings.TrimSpace(external.ExternalID) == "" || strings.TrimSpace(string(external.ExternalSource)) == "" {
+		return nil, errorsx.UnauthorizedI18n("error.e0149")
+	}
+	conversation := ConversationService.Get(conversationID)
+	if conversation == nil {
+		return nil, errorsx.InvalidParamI18n("error.e0116")
+	}
+	if !ConversationService.IsVerifiedCustomerConversationOwner(conversation, customerID) {
+		return nil, errorsx.ForbiddenI18n("error.e0222")
+	}
+	if conversation.Status == enums.IMConversationStatusClosed {
+		return nil, errorsx.InvalidParamI18n("error.e0119")
+	}
+	return conversation, nil
 }
 
 func (s *messageService) ValidateConversationSender(conversationID int64, senderType enums.IMSenderType, operator *dto.AuthPrincipal, external *openidentity.ExternalUser) (*models.Conversation, error) {

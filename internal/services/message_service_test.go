@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"agent-desk/internal/models"
 	"agent-desk/internal/pkg/dto"
 	"agent-desk/internal/pkg/enums"
+	"agent-desk/internal/pkg/errorsx"
 	"agent-desk/internal/pkg/openidentity"
 
 	"github.com/glebarez/sqlite"
@@ -17,6 +19,126 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
+
+// Wrong ID authorization, bypassing ownership on duplicate sends, or changing
+// sender/read metadata must fail these assertions on persisted behavior.
+func TestVerifiedCustomerMessageAuthority(t *testing.T) {
+	db := setupMessageWelcomeTestDB(t)
+	agent := createWelcomeTestAIAgent(t, db, "")
+	ext := openidentity.ExternalUser{ExternalSource: enums.ExternalSourceGuest, ExternalID: "X", ExternalName: "B"}
+	for _, id := range []int64{41, 42} {
+		if err := db.Create(&models.Customer{ID: id, Name: "synthetic"}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Create(&models.CustomerIdentity{CustomerID: id, ExternalSource: enums.ExternalSourceGuest, ExternalID: "X"}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := &models.Conversation{CustomerID: 41, AIAgentID: agent.ID, Status: enums.IMConversationStatusAIServing, CustomerUnreadCount: 1}
+	b := &models.Conversation{CustomerID: 42, AIAgentID: agent.ID, Status: enums.IMConversationStatusAIServing, CustomerUnreadCount: 1}
+	for _, conv := range []*models.Conversation{a, b} {
+		if err := db.Create(conv).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	previousHook := TriggerAIReplyAsyncHook
+	TriggerAIReplyAsyncHook = func(models.Conversation, models.Message) {}
+	t.Cleanup(func() { TriggerAIReplyAsyncHook = previousHook })
+	for _, tc := range []struct {
+		id  int64
+		ext *openidentity.ExternalUser
+	}{{0, &ext}, {-1, &ext}, {41, &ext}, {42, nil}, {42, &openidentity.ExternalUser{ExternalSource: enums.ExternalSourceGuest}}, {42, &openidentity.ExternalUser{ExternalID: "X"}}} {
+		if _, err := MessageService.ValidateVerifiedCustomerSender(b.ID, tc.id, tc.ext); err == nil {
+			t.Errorf("invalid verified sender accepted id=%d", tc.id)
+		}
+	}
+	m, err := MessageService.SendVerifiedCustomerMessageWithRequestID(b.ID, 42, "own-id", "", "  hello B  ", "", ext, "trace-B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Content != "hello B" || m.RequestID != "trace-B" || m.SenderID != 0 || m.SenderType != enums.IMSenderTypeCustomer || m.MessageType != enums.IMMessageTypeText || m.CreateUserID != 0 || m.CreateUserName != "B" {
+		t.Fatalf("own send semantics changed: %+v", m)
+	}
+	again, err := MessageService.SendVerifiedCustomerMessageWithRequestID(b.ID, 42, "own-id", enums.IMMessageTypeText, "replacement", "", ext, "different-trace")
+	if err != nil || again == nil || again.ID != m.ID || again.Content != "hello B" || again.Payload != m.Payload || again.RequestID != "trace-B" || again.SenderID != 0 || again.SenderType != enums.IMSenderTypeCustomer || again.CreateUserName != "B" {
+		t.Error("idempotent own send changed persisted message")
+	}
+	if _, err := MessageService.SendVerifiedCustomerMessageWithRequestID(b.ID, 41, "own-id", enums.IMMessageTypeText, "foreign", "", ext, "foreign-trace"); err == nil {
+		t.Error("cross ID returned existing message before ownership")
+	}
+	var event models.ConversationEventLog
+	if err := db.Where("conversation_id = ?", b.ID).First(&event).Error; err != nil || event.RequestID != "trace-B" {
+		t.Error("send trace event changed")
+	}
+	markers := []models.Message{{ConversationID: a.ID, ClientMsgID: "A-marker", SenderType: enums.IMSenderTypeAI, MessageType: enums.IMMessageTypeText, Content: "A", SendStatus: enums.IMMessageStatusSent}, {ConversationID: b.ID, ClientMsgID: "B-marker", SenderType: enums.IMSenderTypeAI, MessageType: enums.IMMessageTypeText, Content: "B", SendStatus: enums.IMMessageStatusSent}}
+	if err := db.Create(&markers).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := ConversationService.MarkVerifiedCustomerConversationReadToMessage(a.ID, markers[0].ID, 42, &ext); err == nil {
+		t.Error("B read A accepted")
+	}
+	if err := ConversationService.MarkVerifiedCustomerConversationReadToMessage(b.ID, markers[1].ID, 42, &ext); err != nil {
+		t.Fatal(err)
+	}
+	var states []models.ConversationReadState
+	if err := db.Find(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 || states[0].ConversationID != b.ID || states[0].LastReadMessageID != markers[1].ID || states[0].ReaderID != 0 || states[0].ExternalReaderID != "X" || states[0].UpdateUserName != "B" {
+		t.Errorf("read metadata escaped conversation B: %+v", states)
+	}
+	if err := db.Model(b).Update("status", enums.IMConversationStatusClosed).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err = MessageService.SendVerifiedCustomerMessageWithRequestID(b.ID, 42, "own-id", enums.IMMessageTypeText, "closed", "", ext, "")
+	var appErr *errorsx.I18nError
+	if !errors.As(err, &appErr) || appErr.Key != "error.e0119" {
+		t.Errorf("closed conversation no longer rejected: %v", err)
+	}
+}
+
+func TestLegacyGuestMessageRejected(t *testing.T) {
+	db := setupMessageWelcomeTestDB(t)
+	if err := db.AutoMigrate(&models.ConversationAssignment{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.Customer{ID: 41}).Error; err != nil {
+		t.Fatal(err)
+	}
+	ext := openidentity.ExternalUser{ExternalSource: enums.ExternalSourceGuest, ExternalID: "X"}
+	if err := db.Create(&models.CustomerIdentity{CustomerID: 41, ExternalSource: ext.ExternalSource, ExternalID: "X"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	conv := &models.Conversation{CustomerID: 41, Status: enums.IMConversationStatusAIServing}
+	if err := db.Create(conv).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ConversationService.IsCustomerConversationOwner(conv, ext) {
+		t.Error("legacy guest owner guessed mapping")
+	}
+	if _, err := MessageService.ValidateConversationSender(conv.ID, enums.IMSenderTypeCustomer, nil, &ext); err == nil {
+		t.Error("legacy guest sender accepted")
+	}
+	if _, err := MessageService.SendCustomerMessage(conv.ID, "legacy", enums.IMMessageTypeText, "legacy", "", ext); err == nil {
+		t.Error("legacy guest send accepted")
+	}
+	if _, err := MessageService.SendCustomerMessageWithRequestID(conv.ID, "legacy-trace", enums.IMMessageTypeText, "legacy", "", ext, "trace"); err == nil {
+		t.Error("legacy guest send with request accepted")
+	}
+	if err := ConversationService.MarkCustomerConversationReadToMessage(conv.ID, 0, &ext); err == nil {
+		t.Error("legacy guest read accepted")
+	}
+	if err := ConversationService.CloseCustomerConversation(conv.ID, ext); err == nil {
+		t.Error("legacy guest close accepted")
+	}
+	var after models.Conversation
+	if err := db.First(&after, conv.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != enums.IMConversationStatusAIServing {
+		t.Error("legacy guest mutated conversation")
+	}
+}
 
 func TestAllowAIMessageOnPendingHandoff(t *testing.T) {
 	conversation := &models.Conversation{

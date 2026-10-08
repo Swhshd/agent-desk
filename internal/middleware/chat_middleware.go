@@ -23,5 +23,6 @@ func ExternalUserMiddleware(ctx *gin.Context) {
 	}
 	services.CustomerSessionService.SetRefreshHeaders(ctx, result)
 	httpx.SetExternalUser(ctx, result.ExternalUser)
+	httpx.SetVerifiedCustomerID(ctx, result.CustomerID)
 	ctx.Next()
 }

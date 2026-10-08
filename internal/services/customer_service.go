@@ -3,6 +3,7 @@ package services
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 
 	"agent-desk/internal/models"
@@ -114,57 +115,101 @@ func (s *customerService) CountByCompanyIDs(companyIDs []int64) map[int64]int64 
 	return repositories.CustomerRepository.CountByCompanyIDs(sqls.DB(), companyIDs, int(enums.StatusDeleted))
 }
 
+// EnsureExternalCustomer preserves the legacy non-guest adapter entry point.
 func (s *customerService) EnsureExternalCustomer(ctx *sqls.TxContext, externalUser openidentity.ExternalUser) (int64, error) {
+	return s.EnsureVerifiedExternalCustomer(ctx, externalUser)
+}
+
+// CreateFreshGuestCustomer creates a new customer using only the supplied hint.
+// The caller owns the transaction and must propagate errors to roll back both writes.
+func (s *customerService) CreateFreshGuestCustomer(ctx *sqls.TxContext, externalUser openidentity.ExternalUser) (int64, error) {
 	if ctx == nil || ctx.Tx == nil {
 		return 0, errorsx.InvalidParamI18n("error.e0086")
 	}
-	externalSource := externalUser.ExternalSource
-	externalID := strings.TrimSpace(externalUser.ExternalID)
-	if strings.TrimSpace(string(externalSource)) == "" || externalID == "" {
+	externalUser.ExternalID = strings.TrimSpace(externalUser.ExternalID)
+	if externalUser.ExternalSource != enums.ExternalSourceGuest || externalUser.ExternalID == "" {
 		return 0, errorsx.UnauthorizedI18n("error.e0149")
 	}
-	now := time.Now()
-	if identity := repositories.CustomerIdentityRepository.GetBy(ctx.Tx, externalSource, externalID); identity != nil {
-		updates := map[string]any{
-			"last_active_at": now,
-			"updated_at":     now,
-		}
-		if strs.IsNotBlank(externalUser.ExternalName) {
-			updates["name"] = externalUser.ExternalName
-		}
-		if err := repositories.CustomerRepository.Updates(ctx.Tx, identity.CustomerID, updates); err != nil {
-			return 0, err
-		}
+	return s.createExternalCustomer(ctx, externalUser)
+}
 
+// EnsureVerifiedExternalCustomer preserves reuse for verified non-guest sources.
+func (s *customerService) EnsureVerifiedExternalCustomer(ctx *sqls.TxContext, externalUser openidentity.ExternalUser) (int64, error) {
+	if ctx == nil || ctx.Tx == nil {
+		return 0, errorsx.InvalidParamI18n("error.e0086")
+	}
+	externalUser.ExternalID = strings.TrimSpace(externalUser.ExternalID)
+	if externalUser.ExternalSource == enums.ExternalSourceGuest || strings.TrimSpace(string(externalUser.ExternalSource)) == "" || externalUser.ExternalID == "" {
+		return 0, errorsx.UnauthorizedI18n("error.e0149")
+	}
+	identity, err := repositories.CustomerIdentityRepository.GetByExternalIdentity(ctx.Tx, externalUser.ExternalSource, externalUser.ExternalID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return s.createExternalCustomer(ctx, externalUser)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if err := s.TouchVerifiedCustomer(ctx, identity.CustomerID, externalUser); err != nil {
+		return 0, err
+	}
+	return identity.CustomerID, nil
+}
+
+// TouchVerifiedCustomer updates only the exact, previously verified binding.
+func (s *customerService) TouchVerifiedCustomer(ctx *sqls.TxContext, customerID int64, externalUser openidentity.ExternalUser) error {
+	if ctx == nil || ctx.Tx == nil || ctx.RegisterCallback == nil {
+		return errorsx.InvalidParamI18n("error.e0086")
+	}
+	externalUser.ExternalID = strings.TrimSpace(externalUser.ExternalID)
+	if customerID <= 0 || strings.TrimSpace(string(externalUser.ExternalSource)) == "" || externalUser.ExternalID == "" {
+		return errorsx.UnauthorizedI18n("error.e0149")
+	}
+	if _, err := repositories.CustomerIdentityRepository.GetByCustomerIdentity(ctx.Tx, customerID, externalUser.ExternalSource, externalUser.ExternalID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errorsx.UnauthorizedI18n("error.e0149")
+		}
+		return err
+	}
+	customer, err := repositories.CustomerRepository.GetForSession(ctx.Tx, customerID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errorsx.UnauthorizedI18n("error.e0149")
+		}
+		return err
+	}
+	if customer.Status == enums.StatusDeleted {
+		return errorsx.UnauthorizedI18n("error.e0149")
+	}
+	now := time.Now()
+	updates := map[string]any{"last_active_at": now, "updated_at": now}
+	if strs.IsNotBlank(externalUser.ExternalName) {
+		updates["name"] = externalUser.ExternalName
+	}
+	if err := repositories.CustomerRepository.Updates(ctx.Tx, customerID, updates); err != nil {
+		return err
+	}
+	if strs.IsNotBlank(externalUser.ExternalName) {
 		ctx.RegisterCallback(func() {
-			if strs.IsNotBlank(externalUser.ExternalName) {
-				if err := s.syncConversationCustomerName(sqls.DB(), identity.CustomerID, externalUser.ExternalName, nil, now); err != nil {
-					slog.Error("sync conversation customer name failed",
-						"customerId", identity.CustomerID,
-						"customerName", externalUser.ExternalName,
-						"error", err,
-					)
-				}
+			if err := s.syncConversationCustomerName(sqls.DB(), customerID, externalUser.ExternalName, nil, now); err != nil {
+				slog.Error("sync conversation customer name failed", "customerId", customerID, "error", err)
 			}
 		})
-		return identity.CustomerID, nil
 	}
+	return nil
+}
 
+func (s *customerService) createExternalCustomer(ctx *sqls.TxContext, externalUser openidentity.ExternalUser) (int64, error) {
+	now := time.Now()
 	customer := &models.Customer{
-		Name:         buildExternalCustomerName(externalUser),
-		LastActiveAt: &now,
-		Status:       enums.StatusOk,
-		AuditFields:  utils.BuildAuditFields(nil),
+		Name: buildExternalCustomerName(externalUser), LastActiveAt: &now,
+		Status: enums.StatusOk, AuditFields: utils.BuildAuditFields(nil),
 	}
 	if err := repositories.CustomerRepository.Create(ctx.Tx, customer); err != nil {
 		return 0, err
 	}
 	if err := repositories.CustomerIdentityRepository.Create(ctx.Tx, &models.CustomerIdentity{
-		CustomerID:     customer.ID,
-		ExternalSource: externalSource,
-		ExternalID:     externalID,
-		Status:         enums.StatusOk,
-		AuditFields:    utils.BuildAuditFields(nil),
+		CustomerID: customer.ID, ExternalSource: externalUser.ExternalSource, ExternalID: externalUser.ExternalID,
+		Status: enums.StatusOk, AuditFields: utils.BuildAuditFields(nil),
 	}); err != nil {
 		return 0, err
 	}

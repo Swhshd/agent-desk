@@ -101,6 +101,22 @@ func (s *conversationService) getLatestNotFinishedByCustomerID(db *gorm.DB, cust
 }
 
 func (s *conversationService) Create(externalUser openidentity.ExternalUser, channelID, aiAgentID int64) (*models.Conversation, error) {
+	return s.createWithCustomerResolver(externalUser, channelID, aiAgentID, func(ctx *sqls.TxContext) (int64, error) {
+		return CustomerService.EnsureVerifiedExternalCustomer(ctx, externalUser)
+	})
+}
+
+// CreateForCustomer keeps the authenticated customer authoritative through matching.
+func (s *conversationService) CreateForCustomer(customerID int64, externalUser openidentity.ExternalUser, channelID, aiAgentID int64) (*models.Conversation, error) {
+	return s.createWithCustomerResolver(externalUser, channelID, aiAgentID, func(ctx *sqls.TxContext) (int64, error) {
+		if err := CustomerService.TouchVerifiedCustomer(ctx, customerID, externalUser); err != nil {
+			return 0, err
+		}
+		return customerID, nil
+	})
+}
+
+func (s *conversationService) createWithCustomerResolver(externalUser openidentity.ExternalUser, channelID, aiAgentID int64, resolveCustomerID func(*sqls.TxContext) (int64, error)) (*models.Conversation, error) {
 	aiAgent := AIAgentService.Get(aiAgentID)
 	if aiAgent == nil || aiAgent.Status != enums.StatusOk {
 		return nil, errorsx.InvalidParamI18n("error.e0002")
@@ -110,7 +126,7 @@ func (s *conversationService) Create(externalUser openidentity.ExternalUser, cha
 	var welcomeMessage *models.Message
 	created := false
 	if err := sqls.WithTransaction(func(ctx *sqls.TxContext) error {
-		customerID, err := CustomerService.EnsureExternalCustomer(ctx, externalUser)
+		customerID, err := resolveCustomerID(ctx)
 		if err != nil {
 			return err
 		}
@@ -402,6 +418,17 @@ func (s *conversationService) CloseCustomerConversation(conversationID int64, ex
 	return s.closeConversation(conversationID, enums.IMSenderTypeCustomer, "", nil)
 }
 
+func (s *conversationService) CloseVerifiedCustomerConversation(conversationID, customerID int64) error {
+	conversation := s.Get(conversationID)
+	if conversation == nil {
+		return errorsx.InvalidParamI18n("error.e0116")
+	}
+	if !s.IsVerifiedCustomerConversationOwner(conversation, customerID) {
+		return errorsx.ForbiddenI18n("error.e0222")
+	}
+	return s.closeConversation(conversationID, enums.IMSenderTypeCustomer, "", nil)
+}
+
 func (s *conversationService) closeConversation(conversationID int64, senderType enums.IMSenderType, closeReason string, operator *dto.AuthPrincipal) error {
 	if err := sqls.WithTransaction(func(ctx *sqls.TxContext) error {
 		conversation := repositories.ConversationRepository.Get(ctx.Tx, conversationID)
@@ -501,12 +528,30 @@ func (s *conversationService) MarkCustomerConversationReadToMessage(conversation
 	if !s.IsCustomerConversationOwner(conversation, *external) {
 		return errorsx.ForbiddenI18n("error.e0222")
 	}
+	return s.markCustomerConversationRead(conversation, messageID, external)
+}
+
+func (s *conversationService) MarkVerifiedCustomerConversationReadToMessage(conversationID, messageID, customerID int64, external *openidentity.ExternalUser) error {
+	if customerID <= 0 || external == nil || strings.TrimSpace(external.ExternalID) == "" || strings.TrimSpace(string(external.ExternalSource)) == "" {
+		return errorsx.UnauthorizedI18n("error.e0149")
+	}
+	conversation := s.Get(conversationID)
+	if conversation == nil {
+		return errorsx.InvalidParamI18n("error.e0116")
+	}
+	if !s.IsVerifiedCustomerConversationOwner(conversation, customerID) {
+		return errorsx.ForbiddenI18n("error.e0222")
+	}
+	return s.markCustomerConversationRead(conversation, messageID, external)
+}
+
+func (s *conversationService) markCustomerConversationRead(conversation *models.Conversation, messageID int64, external *openidentity.ExternalUser) error {
 	changed, err := s.markConversationReadWithActor(conversation, messageID, customerConversationReadActor{external: external})
 	if err != nil {
 		return err
 	}
 	if changed {
-		if updated := s.Get(conversationID); updated != nil {
+		if updated := s.Get(conversation.ID); updated != nil {
 			WsService.PublishConversationChanged(updated, enums.IMRealtimeEventConversationRead)
 		}
 	}
@@ -663,8 +708,12 @@ func (s *conversationService) countUnreadByState(ctx *sqls.TxContext, conversati
 	return int(count), err
 }
 
+func (s *conversationService) IsVerifiedCustomerConversationOwner(conversation *models.Conversation, customerID int64) bool {
+	return conversation != nil && customerID > 0 && conversation.CustomerID == customerID
+}
+
 func (s *conversationService) IsCustomerConversationOwner(conversation *models.Conversation, externalUser openidentity.ExternalUser) bool {
-	if conversation == nil {
+	if conversation == nil || externalUser.ExternalSource == enums.ExternalSourceGuest {
 		return false
 	}
 	extID := strings.TrimSpace(externalUser.ExternalID)
